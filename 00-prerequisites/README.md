@@ -32,14 +32,16 @@ Hai nhánh chỉ khác nhau ở **Bước 3 và Bước 4**. Bài 01–04 dùng 
 kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
 ```
 
-Kết quả mong đợi:
+Kết quả mong đợi (tên node trên cluster quản lý thường dài, đó là bình thường):
 
 ```
-NAME            GPU
-h100-node-01    2
+NAME                                                      GPU
+fke-ncp-modas-stg-...-workers-z1-f9f69-dn24z              8
+fke-ncp-modas-stg-...-workers-z1-f9f69-wknqc              7
 ```
 
 - **Bài 01–03** cần 1 GPU. **Bài 04** cần 2 GPU.
+- Cluster có nhiều GPU hơn không sao — mỗi deployment chỉ xin đúng phần mình cần. Nhưng nhớ **xoá deployment của bài trước** trước khi sang bài mới, nếu không bạn đang so sánh trên mức tranh chấp tài nguyên khác nhau.
 - Nếu cột GPU trống → chưa cài NVIDIA GPU Operator:
 
   ```bash
@@ -67,8 +69,27 @@ h100-node-01    2
 ## Bước 1: Tạo namespace
 
 ```bash
-kubectl apply -f 00-namespace.yaml
+# Chỉ tạo nếu chưa có — xem ghi chú bên dưới
+kubectl get ns token-factory >/dev/null 2>&1 || kubectl apply -f 00-namespace.yaml
+
 kubectl config set-context --current --namespace=token-factory
+```
+
+> **Nhánh Workshop: namespace đã được cấp sẵn, hãy bỏ qua bước tạo.**
+>
+> Trên cluster quản lý (FPT Cloud FKE), mỗi học viên được cấp trước một namespace kèm ServiceAccount bị giới hạn quyền. Tài khoản đó **tạo được** namespace mới nhưng **không patch được** namespace đã có, nên `kubectl apply -f 00-namespace.yaml` sẽ báo:
+>
+> ```
+> Error from server (Forbidden): namespaces "token-factory" is forbidden:
+> User "system:serviceaccount:token-factory:..." cannot patch resource "namespaces"
+> ```
+>
+> Đây **không phải lỗi của bạn** — namespace đã tồn tại và dùng được ngay. Dòng lệnh `kubectl get ... || kubectl apply ...` ở trên xử lý cả hai trường hợp.
+
+Xác nhận namespace rỗng trước khi bắt đầu:
+
+```bash
+kubectl get all -n token-factory
 ```
 
 ## Bước 2: Tạo secret HF_TOKEN
@@ -91,51 +112,68 @@ File `01-hf-secret.yaml` chỉ là **template tham khảo** cho GitOps (môi tr�
 
 Trọng số đã được ban tổ chức stage sẵn tại **`/mnt/hps/fp8_models`** trên node GPU. Ta chỉ cần bọc thư mục đó thành một PVC.
 
-**Trước khi apply, sửa tên node** trong `02-storage-workshop.yaml`:
+Manifest này **không cần sửa gì** trước khi apply: `/mnt/hps` là shared storage hiện diện giống nhau trên mọi worker node, nên PV không khai báo `nodeAffinity` và pod nằm ở node nào cũng đọc được trọng số.
 
-```yaml
-nodeAffinity:
-  required:
-    nodeSelectorTerms:
-      - matchExpressions:
-          - key: kubernetes.io/hostname
-            operator: In
-            values:
-              - h100-node-01        # <-- SỬA cho khớp `kubectl get nodes`
-```
-
-Rồi apply:
+Apply:
 
 ```bash
 kubectl apply -f 02-storage-workshop.yaml
-kubectl get pv,pvc -n token-factory
+kubectl get pvc -n token-factory
 ```
 
-Kết quả mong đợi:
+Kết quả mong đợi — **cả ba đều `Bound` ngay lập tức**:
 
 ```
-NAME                                CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM
-persistentvolume/model-weights-pv   200Gi      RWO            Retain           Bound    token-factory/model-cache
-
-NAME                                  STATUS   VOLUME             CAPACITY
-persistentvolumeclaim/model-cache     Bound    model-weights-pv   200Gi
-persistentvolumeclaim/vllm-cache      Bound    pvc-xxxx           20Gi
-persistentvolumeclaim/bench-results   Bound    pvc-xxxx           5Gi
+NAME            STATUS   VOLUME                        CAPACITY   STORAGECLASS
+bench-results   Bound    token-factory-bench-results   5Gi        hps-local
+model-cache     Bound    token-factory-model-weights   500Gi      hps-local
+vllm-cache      Bound    token-factory-vllm-cache      20Gi       hps-local
 ```
 
-### Ba chi tiết đáng chú ý trong manifest này
+Nếu có PVC nào ở `Pending` quá vài giây, xem [Xử lý sự cố storage](#xử-lý-sự-cố-storage).
+
+### Năm chi tiết đáng chú ý trong manifest này
 
 | Chi tiết | Vì sao |
 |---|---|
-| `persistentVolumeReclaimPolicy: Retain` | **Quan trọng nhất.** Với `Delete`, xoá PVC sẽ xoá luôn dữ liệu trên host — nghĩa là xoá mất trọng số dùng chung của cả lớp. `Retain` khiến việc đó không thể xảy ra |
+| `persistentVolumeReclaimPolicy: Retain` | **Quan trọng nhất.** Với `Delete`, xoá PVC sẽ xoá luôn dữ liệu — nghĩa là xoá mất thư viện model dùng chung của cả tổ chức. `Retain` khiến việc đó không thể xảy ra |
 | `hostPath.type: Directory` | Pod **fail ngay lập tức** nếu `/mnt/hps/fp8_models` không tồn tại, thay vì âm thầm tạo thư mục rỗng rồi để vLLM crash sau 3 phút với lỗi khó hiểu |
-| `nodeAffinity` | `hostPath` chỉ có nghĩa trên đúng node có thư mục đó. Thiếu nodeAffinity, pod có thể bị lên lịch sang node khác và thấy thư mục rỗng |
+| `claimRef` | Ghim PV vào đúng một PVC (namespace + tên). Chắc chắn hơn label selector: không PVC nào khác chiếm mất được, và PV cũng không bind nhầm sang claim trùng tên ở namespace khác |
+| `storageClassName: hps-local` | Quy ước của cluster cho mọi PV trỏ vào `/mnt/hps`. **Không** dùng StorageClass mặc định — lý do ở mục dưới |
+| Không có `nodeAffinity` | `/mnt/hps` là shared storage, hiện diện giống nhau trên mọi node. Ghim node sẽ làm pod không lên lịch được mà chẳng được lợi gì |
 
 ### Vì sao có PVC `vllm-cache` riêng
 
 Thư mục trọng số trên host được mount **read-only** (nhiều học viên dùng chung, không ai được phép ghi đè). Nhưng vLLM cần ghi cache biên dịch `torch.compile`. Vì vậy ta tách ra một PVC nhỏ riêng, và các manifest đặt `VLLM_CACHE_ROOT=/cache`.
 
 Lợi ích phụ đáng kể cho workshop: cache này **tồn tại xuyên suốt cả 4 bài**, nên từ lần deploy thứ hai trở đi thời gian khởi động giảm rõ rệt.
+
+---
+
+### Vì sao KHÔNG dùng StorageClass mặc định
+
+Cách thông thường là để trống `storageClassName` cho `vllm-cache` và `bench-results` rồi để cluster cấp phát động. **Trên cluster workshop, cách đó hỏng.**
+
+StorageClass mặc định `storageclass-20k` (`csi.vastdata.com`) bind PVC thành công nhưng **không attach được vào pod**:
+
+```
+AttachVolume.Attach failed for volume "pvc-xxxx" :
+  rpc error: code = Unknown desc = [ControllerPublishVolume]:
+  No VIP Pool named 'NCP-PRODUCT-STG-2821'
+```
+
+Triệu chứng nhìn thấy: pod kẹt `ContainerCreating` **vô thời hạn** — rất dễ nhầm là "đang kéo image chậm". Vì vậy cả ba PVC của chuỗi bài đều đi qua `/mnt/hps` bằng `hps-local`.
+
+> **Bài học vận hành:** `PVC Bound` **không** có nghĩa là storage dùng được. Bind và attach là hai giai đoạn khác nhau; lỗi attach chỉ lộ ra khi có pod thật mount vào. Luôn kiểm chứng bằng một pod thật trước khi kết luận storage OK.
+
+### Xử lý sự cố storage
+
+| Triệu chứng | Nguyên nhân | Cách xử lý |
+|---|---|---|
+| PVC ở `Pending` mãi | SC dùng `WaitForFirstConsumer` (bind khi có pod đầu tiên), hoặc không có PV khớp | `kubectl describe pvc <tên>`. Với `hps-local` + `claimRef`, PVC phải `Bound` ngay |
+| Pod kẹt `ContainerCreating` rất lâu | Lỗi **attach**, không phải kéo image | `kubectl describe pod <tên>` xem mục `Events` tìm `FailedAttachVolume` |
+| `model-cache` không bind | PV và PVC lệch `storageClassName`, hoặc `claimRef` trỏ sai namespace | Cả hai phải là `hps-local`; `claimRef.namespace` phải là `token-factory` |
+| PV `Released` không tái dùng được | PV còn giữ `claimRef` của claim cũ đã xoá | Dùng tên PV riêng cho khoá học (manifest đặt tiền tố `token-factory-`) để tránh đụng PV có sẵn trên cluster |
 
 ---
 
@@ -191,23 +229,25 @@ kubectl logs -f job/verify-models -n token-factory
 Kết quả mong đợi:
 
 ```
-===== Cây thư mục thực tế dưới /models (2 cấp) =====
-/models
-/models/Qwen
-/models/Qwen3.8-27B-FP8
-/models/RedHatAI
-/models/Qwen3.8-27B-speculator.dspark
-
 ===== [1/2] Target model =====
+Mong đợi: /models/Qwen/Qwen3.8-27B-FP8
   OK  config.json
-  OK  số file safetensors: 6
+  OK  số file safetensors: 68
+  OK  mtp.safetensors (bài 02 dùng MTP head này)
+  dung lượng: 30.5G
+
 ===== [2/2] DSpark speculator =====
+Mong đợi: /models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview
   OK     config.json
   OK     config.py
   OK     model.safetensors
 
+==================================================
 DAT — trọng số đã sẵn sàng. Tiếp tục sang bài 01.
+==================================================
 ```
+
+Dòng `mtp.safetensors` đáng chú ý: đó là **MTP head huấn luyện sẵn nằm ngay trong checkpoint target**, thứ mà [bài 02](../02-spec-decode-mtp/) dùng để bật speculative decoding chỉ bằng một cờ. Nếu dòng đó báo cảnh báo, bài 02 sẽ không chạy được.
 
 Nếu job **FAIL**, log sẽ in ra cây thư mục thật và hướng dẫn xử lý. Xem tiếp [Layout thư mục trọng số](#layout-thư-mục-trọng-số).
 
@@ -224,9 +264,37 @@ kubectl wait --for=condition=ready pod -l app=bench-client -n token-factory --ti
 
 Pod này chứa sẵn `vllm` CLI (chỉ dùng phần client, không xin GPU) và mount PVC `bench-results` để lưu JSON kết quả của cả 4 bài — nhờ vậy bài 99 so sánh được mọi thứ trong một bảng.
 
+Kiểm chứng client hoạt động trước khi sang bài 01:
+
+```bash
+kubectl exec deploy/bench-client -n token-factory -- bash -c '
+  python3 -c "import vllm; print(\"vLLM\", vllm.__version__)"
+  ls $MODEL_PATH/config.json
+  touch /results/.probe && echo "/results ghi được" && rm /results/.probe
+  touch /models/.probe 2>/dev/null || echo "/models read-only (đúng thiết kế)"
+'
+```
+
+Kết quả mong đợi:
+
+```
+vLLM 0.29.0
+/models/Qwen/Qwen3.8-27B-FP8/config.json
+/results ghi được
+/models read-only (đúng thiết kế)
+```
+
+Vào shell để làm benchmark ở các bài sau:
+
 ```bash
 kubectl exec -it deploy/bench-client -n token-factory -- bash
 ```
+
+> **Mẹo tra cứu cờ `vllm bench serve`.** Từ 0.29.0, `--help` chỉ liệt kê **nhóm cấu hình** chứ không liệt kê từng cờ. Muốn xem đầy đủ phải dùng:
+>
+> ```bash
+> vllm bench serve --help=all
+> ```
 
 > **Client phải đủ mạnh.** Manifest xin 8 CPU vì ở concurrency 64 với output 1000 token, chính bench client có thể trở thành bottleneck và cho ra số liệu latency sai lệch. Nếu node của bạn eo hẹp CPU, hãy giảm mức concurrency cao nhất thay vì giảm CPU của client.
 
@@ -241,36 +309,68 @@ kubectl delete job gpu-check -n token-factory
 Kết quả mong đợi:
 
 ```
-NVIDIA H100 80GB HBM3, 81559 MiB, 5xx.xx, 9.0
+NVIDIA H100 80GB HBM3, 81559 MiB, 580.126.20, 9.0
 ```
 
-Ghi lại con số bộ nhớ. Toàn bộ tính toán ngân sách ở các bài sau dựa trên **80 GB**; nếu bạn dùng H100 40GB hoặc H100 NVL, các giá trị `--gpu-memory-utilization` sẽ phải điều chỉnh. Cột cuối (`9.0`) là compute capability — H100 là SM90, con số này có liên quan ở bài 03.
+Ghi lại con số bộ nhớ. Toàn bộ tính toán ngân sách ở các bài sau dựa trên **80 GB** (`81559 MiB` khả dụng); nếu bạn dùng H100 40GB hoặc H100 NVL, các giá trị `--gpu-memory-utilization` sẽ phải điều chỉnh.
+
+Cột cuối (`9.0`) là compute capability — H100 là **SM90**. Con số này có liên quan ở [bài 03](../03-spec-decode-dspark/): tài liệu adaptive verification của vLLM tham chiếu các backend trên SM100, nên tính năng đó là mục **tuỳ chọn** phải tự kiểm chứng.
 
 ---
 
 ## Layout thư mục trọng số
 
-Trên host workshop, trọng số nằm **phẳng** ngay dưới `/mnt/hps/fp8_models`, không có cấp thư mục tổ chức theo namespace HuggingFace:
+`/mnt/hps/fp8_models` là **thư viện model dùng chung của cả tổ chức**, chứa hàng chục model. Nó tổ chức theo namespace HuggingFace, và các speculator nằm riêng dưới `speculators/`:
 
 ```
-/mnt/hps/fp8_models/                          <- mount vào /models trong container
-├── Qwen3.8-27B-FP8/                          <- target model  (bài 01, 02, 03, 04)
-│   ├── config.json
-│   └── model-0000x-of-0000y.safetensors
-└── Qwen3.8-27B-speculator.dspark/            <- DSpark speculator (bài 03, 04)
-    ├── config.json
-    ├── config.py
-    └── model.safetensors
+/mnt/hps/fp8_models/                      <- mount vào /models trong container
+├── Qwen/
+│   ├── Qwen3.8-27B-FP8/                  <-- TARGET (bài 01, 02, 03, 04)
+│   ├── Qwen3.6-27B-FP8/
+│   └── ...
+├── RedHatAI/
+├── MiniMaxAI/
+└── speculators/
+    ├── RedHatAI/
+    │   ├── Qwen3.8-27B-speculator.dspark-preview/   <-- SPECULATOR (bài 03, 04)
+    │   └── ...
+    └── RadixArk/
 ```
 
-Vì vậy mọi manifest và lệnh benchmark dùng đúng hai đường dẫn:
+Hai đường dẫn mà mọi manifest và lệnh benchmark dùng:
 
 ```
-/models/Qwen3.8-27B-FP8
-/models/Qwen3.8-27B-speculator.dspark
+/models/Qwen/Qwen3.8-27B-FP8
+/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview
 ```
 
-Nhánh tự học ở nhà tải về **đúng cấu trúc phẳng này**, nên hai nhánh dùng chung manifest không cần sửa gì.
+### Bên trong target — hai điều đáng chú ý
+
+```
+Qwen3.8-27B-FP8/           (30.5 GB)
+├── config.json
+├── layers-0.safetensors ... layers-63.safetensors    <- tách theo lớp
+├── outside.safetensors                               <- embedding + lm_head
+├── mtp.safetensors        (477 MB)                   <- MTP head!
+├── model.safetensors.index.json
+└── tokenizer.json, chat_template.jinja, ...
+```
+
+1. **`mtp.safetensors` có sẵn** — đây chính là MTP head mà [bài 02](../02-spec-decode-mtp/) dùng. Không cần tải thêm gì.
+2. **Trọng số tách theo từng lớp** (`layers-N.safetensors`) thay vì shard đều. Đây là layout tối ưu cho vLLM nạp song song, không phải layout HuggingFace chuẩn — đừng ngạc nhiên khi thấy 68 file safetensors.
+
+### Bên trong speculator
+
+```
+Qwen3.8-27B-speculator.dspark-preview/    (7.6 GB tổng)
+├── config.json           <- block_size: 8
+├── config.py             <- cần --trust-remote-code
+├── model.safetensors     (4.0 GB)  <- trọng số serving
+├── optimizer_state_dict.pt (4.2 GB) <- artefact HUẤN LUYỆN, vLLM không đọc
+└── scheduler_state_dict.pt
+```
+
+Hơn một nửa dung lượng thư mục là artefact huấn luyện mà vLLM không bao giờ đọc tới. Nhánh tự học ở nhà chỉ tải 3 file đầu.
 
 ### Nếu layout trên máy bạn khác
 
@@ -279,9 +379,10 @@ Job ở [Bước 4](#bước-4-xác-minh-trọng-số) sẽ in ra cây thư mụ
 **Cách 1 — tạo symlink trên host** (khuyến nghị: sửa một lần, không đụng vào manifest):
 
 ```bash
-# Ví dụ: trọng số thật đang nằm ở /mnt/hps/fp8_models/qwen3.8-27b-fp8-v2/
+# Ví dụ: trọng số thật đang nằm phẳng ở /mnt/hps/fp8_models/Qwen3.8-27B-FP8
 cd /mnt/hps/fp8_models
-sudo ln -s qwen3.8-27b-fp8-v2 Qwen3.8-27B-FP8
+sudo mkdir -p Qwen
+sudo ln -s ../Qwen3.8-27B-FP8 Qwen/Qwen3.8-27B-FP8
 ```
 
 **Cách 2 — sửa manifest.** Các chỗ cần đổi:
@@ -295,12 +396,14 @@ sudo ln -s qwen3.8-27b-fp8-v2 Qwen3.8-27B-FP8
 | `00-prerequisites/04-bench-client.yaml` | 1 | biến `MODEL_PATH` |
 | `00-prerequisites/06-verify-models-job.yaml` | 2 | biến `TARGET` và `DRAFT` |
 
-Và trong các README, mọi cờ `--tokenizer /models/Qwen3.8-27B-FP8` của lệnh benchmark.
+Job xác minh ở Bước 4 sẽ tự `find /models -maxdepth 3 -iname "*Qwen3.8*"` và in ra các thư mục ứng viên khi thất bại, nên bạn không phải tự mò.
+
+Và trong các README, mọi cờ `--tokenizer /models/Qwen/Qwen3.8-27B-FP8` của lệnh benchmark.
 
 Kiểm tra còn sót chỗ nào:
 
 ```bash
-grep -rn "/models/Qwen3.8" . --include="*.yaml" --include="*.md"
+grep -rn "/models/Qwen\|/models/speculators" . --include="*.yaml" --include="*.md"
 ```
 
 ---

@@ -14,23 +14,26 @@ spec:
       containers:
         - name: verify
           image: busybox:1.36
+          imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
             - |
-              TARGET=/models/Qwen3.8-27B-FP8
-              DRAFT=/models/Qwen3.8-27B-speculator.dspark
+              TARGET=/models/Qwen/Qwen3.8-27B-FP8
+              DRAFT=/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview
               RC=0
-
-              echo "===== Cây thư mục thực tế dưới /models (2 cấp) ====="
-              find /models -maxdepth 2 -type d 2>/dev/null | sort
-              echo
 
               echo "===== [1/2] Target model ====="
               echo "Mong đợi: ${TARGET}"
               if [ -f "${TARGET}/config.json" ]; then
                 echo "  OK  config.json"
-                ls "${TARGET}" | grep -c safetensors | xargs echo "  OK  số file safetensors:"
-                du -sh "${TARGET}" 2>/dev/null
+                echo "  OK  số file safetensors: $(ls "${TARGET}" | grep -c safetensors)"
+                # mtp.safetensors = MTP head tích hợp -> bài 02 dùng được
+                if [ -f "${TARGET}/mtp.safetensors" ]; then
+                  echo "  OK  mtp.safetensors (bài 02 dùng MTP head này)"
+                else
+                  echo "  CANH BAO: không thấy mtp.safetensors — bài 02 (MTP) có thể không chạy"
+                fi
+                echo "  dung lượng: $(du -sh "${TARGET}" 2>/dev/null | cut -f1)"
               else
                 echo "  THIEU: không thấy ${TARGET}/config.json"
                 RC=1
@@ -51,14 +54,15 @@ spec:
 
               if [ "${RC}" != "0" ]; then
                 echo "=================================================="
-                echo "KHONG DAT. Hai cách xử lý:"
-                echo ""
-                echo "  A. Layout trên host khác với mong đợi"
-                echo "     -> Xem cây thư mục in ở đầu log, rồi sửa đường dẫn"
-                echo "        trong các file deployment.yaml của bài 01-04."
-                echo "        Có đúng 3 chỗ cần sửa mỗi bài — README bài 00"
-                echo "        mục 'Điều chỉnh đường dẫn' liệt kê đầy đủ."
-                echo ""
+                echo "KHONG DAT."
+                echo
+                echo "Các thư mục có thể khớp, tìm dưới /models:"
+                find /models -maxdepth 3 -iname "*Qwen3.8*" 2>/dev/null | head -20
+                echo
+                echo "Hai cách xử lý:"
+                echo "  A. Layout khác mong đợi -> sửa đường dẫn trong deployment.yaml"
+                echo "     của bài 01-04. README bài 00 mục 'Layout thư mục trọng số'"
+                echo "     liệt kê đầy đủ các chỗ cần sửa."
                 echo "  B. Trọng số chưa được stage"
                 echo "     -> Lane tự học: chạy 03-model-download-job.yaml"
                 echo "     -> Lane workshop: báo ban tổ chức"
@@ -77,3 +81,4 @@ spec:
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-cache
+            readOnly: true

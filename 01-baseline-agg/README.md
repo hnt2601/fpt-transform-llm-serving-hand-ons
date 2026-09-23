@@ -181,7 +181,7 @@ for C in 1 8 32 64; do
     --endpoint /v1/chat/completions \
     --base-url http://vllm-agg:8000 \
     --model qwen3.8-27b \
-    --tokenizer /models/Qwen3.8-27B-FP8 \
+    --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
     --dataset-name random \
     --random-prefix-len 2048 \
     --random-input-len 8000 \
@@ -268,7 +268,7 @@ Chạy một test riêng để **nhìn thấy** interference. Ở một terminal
 ```bash
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-agg:8000 --model qwen3.8-27b \
-  --tokenizer /models/Qwen3.8-27B-FP8 \
+  --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
   --dataset-name random --random-input-len 30000 --random-output-len 50 \
   --num-prompts 64 --max-concurrency 16 --request-rate inf --ignore-eos
 ```
@@ -278,7 +278,7 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
 ```bash
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-agg:8000 --model qwen3.8-27b \
-  --tokenizer /models/Qwen3.8-27B-FP8 \
+  --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
   --dataset-name random --random-input-len 1000 --random-output-len 500 \
   --num-prompts 20 --max-concurrency 1 --request-rate inf --ignore-eos \
   --percentile-metrics ttft,tpot,itl --metric-percentiles 50,99

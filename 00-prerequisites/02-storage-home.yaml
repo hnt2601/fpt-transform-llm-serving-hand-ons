@@ -7,6 +7,13 @@
 # Khác biệt duy nhất so với lane workshop: `model-cache` là PVC
 # dynamic GHI ĐƯỢC (để job tải về), thay vì hostPath read-only.
 # Các bài 01-04 KHÔNG cần sửa gì — vẫn mount cùng tên PVC vào /models.
+#
+# LƯU Ý: file này dựa vào dynamic provisioning CHẠY ĐƯỢC. Hãy kiểm
+# chứng bằng một pod thật, đừng tin mỗi trạng thái `Bound`:
+#   kubectl get pvc -n token-factory
+#   kubectl describe pod <pod-dùng-pvc> | sed -n '/Events:/,$p'
+# Nếu thấy `FailedAttachVolume`, StorageClass của bạn hỏng —
+# chuyển sang hostPath PV như 02-storage-workshop.yaml.
 # ==============================================================
 ---
 apiVersion: v1

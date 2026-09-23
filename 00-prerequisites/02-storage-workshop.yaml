@@ -1,45 +1,45 @@
 # ==============================================================
-# LANE WORKSHOP — trọng số model ĐÃ CÓ SẴN trên host.
+# LANE WORKSHOP — trọng số model ĐÃ CÓ SẴN trên shared storage.
 #
-# Ban tổ chức đã stage sẵn trọng số tại host path:
+# Ban tổ chức đã stage sẵn trọng số tại:
 #     /mnt/hps/fp8_models
 #
-# File này KHÔNG tải gì cả. Nó chỉ bọc thư mục host đó lại thành
-# một PVC tên `model-cache` để các bài 01-04 mount vào /models.
+# File này KHÔNG tải gì cả. Nó chỉ bọc thư mục đó lại thành một
+# PVC tên `model-cache` để các bài 01-04 mount vào /models.
 #
 # Nếu bạn tự thực hành ở nhà (không có sẵn trọng số), dùng
 # 02-storage-home.yaml thay cho file này, rồi chạy
 # 03-model-download-job.yaml.
 # ==============================================================
 ---
-# PV bọc thư mục host chứa trọng số. hostPath chỉ dùng được khi pod
-# chạy đúng trên node có thư mục đó -> nodeAffinity ghim lại.
+# PV bọc thư mục trọng số trên HPS (High Performance Storage).
+#
+# KHÔNG cần nodeAffinity: /mnt/hps là mount DÙNG CHUNG, hiện diện
+# giống nhau trên mọi worker node. Đây là lý do các PV hps-local
+# khác trên cluster cũng không khai báo nodeAffinity.
+#
+# claimRef ghim PV vào đúng một PVC (namespace + tên). Chắc chắn
+# hơn label selector: không PVC nào khác có thể chiếm mất PV này,
+# và PV cũng không bị bind nhầm sang claim khác trùng tên.
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: model-weights-pv
+  name: token-factory-model-weights
   labels:
     fpt.transform/role: model-weights
 spec:
   capacity:
-    storage: 200Gi          # chỉ là nhãn; hostPath không thực sự giới hạn
+    storage: 500Gi         # chỉ là nhãn; hostPath không thực sự giới hạn
   accessModes:
     - ReadWriteOnce
-  persistentVolumeReclaimPolicy: Retain   # KHÔNG BAO GIỜ xoá dữ liệu host
-  storageClassName: manual
+  persistentVolumeReclaimPolicy: Retain   # KHÔNG BAO GIỜ xoá dữ liệu dùng chung
+  storageClassName: hps-local             # quy ước của cluster cho /mnt/hps
+  claimRef:
+    namespace: token-factory
+    name: model-cache
   hostPath:
     path: /mnt/hps/fp8_models
-    type: Directory         # deploy sẽ FAIL NGAY nếu thư mục không tồn tại
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: In
-              values:
-                # SỬA cho khớp tên node GPU của bạn:
-                #   kubectl get nodes
-                - h100-node-01
+    type: Directory        # FAIL NGAY nếu thư mục không tồn tại
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -51,15 +51,47 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 200Gi
-  storageClassName: manual        # khớp PV ở trên, không dùng dynamic provisioning
-  selector:
-    matchLabels:
-      fpt.transform/role: model-weights
+      storage: 500Gi
+  storageClassName: hps-local    # khớp PV ở trên, KHÔNG dùng dynamic provisioning
 ---
-# Cache biên dịch torch.compile. TÁCH RIÊNG khỏi model-cache vì thư mục
-# trọng số trên host là dùng chung và được mount READ-ONLY.
+# ==============================================================
+# HAI PVC GHI ĐƯỢC — cũng dùng hps-local, KHÔNG dùng SC mặc định.
+#
+# LÝ DO: trên cluster FKE này, StorageClass mặc định
+# (`storageclass-20k`, csi.vastdata.com) bind được PVC nhưng
+# KHÔNG attach được vào pod:
+#
+#   AttachVolume.Attach failed ... No VIP Pool named 'NCP-PRODUCT-STG-2821'
+#
+# Pod sẽ kẹt ContainerCreating vô thời hạn. Vì vậy cả 3 PVC của
+# chuỗi bài đều đi qua /mnt/hps (shared storage đã hoạt động ổn).
+#
+# Nếu cluster của bạn có dynamic provisioning CHẠY ĐƯỢC, có thể
+# thay hai khối PV dưới đây bằng PVC thường không khai
+# storageClassName để dùng SC mặc định.
+# ==============================================================
+---
+# Cache biên dịch torch.compile. TÁCH RIÊNG khỏi model-cache vì thư
+# mục trọng số là dùng chung và được mount READ-ONLY.
 # Giữ cache này giúp lần deploy thứ hai trở đi khởi động nhanh hơn nhiều.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: token-factory-vllm-cache
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: hps-local
+  claimRef:
+    namespace: token-factory
+    name: vllm-cache
+  hostPath:
+    path: /mnt/hps/token-factory/vllm-cache
+    type: DirectoryOrCreate     # kubelet tự tạo nếu chưa có
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -71,9 +103,27 @@ spec:
   resources:
     requests:
       storage: 20Gi
-  # storageClassName: <SỬA CHO KHỚP CLUSTER CỦA BẠN>   # xem: kubectl get sc
+  storageClassName: hps-local
 ---
 # Lưu kết quả benchmark JSON của cả 4 bài.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: token-factory-bench-results
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: hps-local
+  claimRef:
+    namespace: token-factory
+    name: bench-results
+  hostPath:
+    path: /mnt/hps/token-factory/bench-results
+    type: DirectoryOrCreate
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -85,4 +135,4 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  # storageClassName: <SỬA CHO KHỚP CLUSTER CỦA BẠN>
+  storageClassName: hps-local
