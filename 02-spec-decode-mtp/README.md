@@ -107,6 +107,30 @@ Giải thích từng khoá:
 
 Ngoài ra `--gpu-memory-utilization` giảm nhẹ xuống `0.88`: bộ verify cần thêm bộ đệm cho draft token và CUDA graph của nhánh speculative.
 
+### Cái giá bằng KV cache
+
+So số đo thật với bài 01:
+
+| | Bài 01 (baseline) | Bài 02 (MTP) | Chênh |
+|---|---:|---:|---:|
+| `--gpu-memory-utilization` | 0.90 | 0.88 | |
+| KV cache | 39.47 GiB | **36.25 GiB** | −3.2 GiB |
+| Số token | 1.200.036 | **973.279** | −19% |
+| Session @128k | 9.16 | **7.43** | −19% |
+
+MTP không tốn thêm trọng số (nó nằm sẵn trong checkpoint), nhưng vẫn **mất 19% KV cache** cho bộ đệm draft và CUDA graph của nhánh speculative. Đây là chi phí thật cần ghi nhận: bạn đổi **số session phục vụ song song** lấy **tốc độ mỗi session**.
+
+> Nếu Token Factory đang bị giới hạn bởi số session đồng thời chứ không phải tốc độ gõ, MTP có thể là đánh đổi sai. Bảng ở Bước 4 sẽ cho bạn dữ liệu để quyết định.
+
+### Khởi động nhanh hơn hẳn bài 01
+
+```
+Bài 01: 7 phút 07 giây   (compile từ đầu)
+Bài 02: 3 phút 31 giây   (dùng lại cache)
+```
+
+Chênh lệch này đến từ PVC `vllm-cache` dựng ở [bài 00](../00-prerequisites/): kết quả `torch.compile` và FlashInfer autotune được giữ giữa các lần deploy. Phần phải compile lại chỉ là những gì thực sự đổi — nhánh speculative.
+
 ### Ba dòng log xác nhận MTP đang chạy
 
 ```
@@ -230,11 +254,43 @@ done
 **Tăng tốc lớn nhất ở concurrency thấp, giảm dần khi concurrency tăng.** Đây không phải lỗi cấu hình — đây là bản chất:
 
 - Ở **concurrency 1**, GPU cực kỳ dư compute. Verify 3 token thay vì 1 gần như miễn phí → tăng tốc gần bằng acceptance length.
-- Ở **concurrency 64**, batch đã lớn, GPU không còn dư compute. Mỗi draft token bị từ chối giờ là **lãng phí compute thật**. Tăng tốc co lại, và ở batch đủ lớn speculative decoding thậm chí có thể **chậm hơn** baseline.
+- Ở **concurrency 64**, batch đã lớn, GPU không còn dư compute. Mỗi draft token bị từ chối giờ là **lãng phí compute thật**.
 
 Quy luật này áp dụng cho **mọi** phương pháp speculative decoding, kể cả DSpark ở bài 03 — nên đừng kỳ vọng con số tăng tốc ở concurrency 1 lặp lại ở concurrency 64.
 
-**Bài học vận hành:** speculative decoding không phải cờ "bật rồi quên". Ở giờ cao điểm của Token Factory (concurrency cao) lợi ích thu hẹp. Bài 03 sẽ giới thiệu **adaptive verification** — cơ chế tự điều chỉnh theo tải, chính là để xử lý vấn đề này.
+### Điều bất ngờ nhất trong số liệu: acceptance length KHÔNG đổi
+
+Đây là chỗ nhiều người hiểu sai. Hãy nhìn hai cột này cạnh nhau (số đo thật):
+
+| Concurrency | Acceptance length | Tăng tốc TPOT thực đo |
+|---|---:|---:|
+| 1 | 2.29 | **1.74×** |
+| 8 | 2.18 | **1.36×** |
+| 32 | 2.20 | **1.22×** |
+
+**Acceptance length gần như là hằng số.** Nó phải như vậy: acceptance đo xem drafter đoán có trúng không — mà điều đó phụ thuộc vào **model và dữ liệu**, hoàn toàn không phụ thuộc bạn đang chạy 1 hay 32 request song song.
+
+Vậy tại sao tăng tốc lại teo từ 1.74× xuống 1.22×?
+
+> **Vì lợi ích của speculative decoding không nằm ở việc đoán trúng, mà ở việc COMPUTE ĐANG RẢNH.**
+>
+> Ở concurrency 1, GPU chỉ đang chờ bộ nhớ; verify thêm 2 token là miễn phí. Ở concurrency 32, GPU đã bận thật, và 2 token verify thêm giờ phải **cạnh tranh** với công việc của 31 request khác.
+>
+> Nói cách khác: bạn không mất khả năng đoán, bạn mất **chỗ trống để tận dụng việc đoán đó**.
+
+Hệ quả vận hành rất cụ thể: **đừng dùng acceptance length để dự đoán tăng tốc ở production.** Acceptance length tốt chỉ nói rằng drafter phù hợp với dữ liệu của bạn. Tăng tốc thực tế còn phụ thuộc mức tải — và phải đo ở đúng mức tải bạn định chạy.
+
+### Ba điều nữa số liệu cho thấy
+
+**1. Tăng tốc thực luôn thấp hơn acceptance length.** Ở c1: acceptance 2.29 nhưng chỉ tăng tốc 1.74× — hiệu suất **76%**. Phần hụt là chi phí chạy MTP head và verify 3 token thay vì 1. Tỉ lệ này là thước đo "drafter có đủ rẻ không".
+
+**2. TTFT cũng cải thiện, dù về lý thuyết không nên.** Số đo ở c8: TTFT p50 từ 2506 xuống **624 ms**. Speculative decoding chỉ tác động lên decode, nhưng decode xong nhanh hơn nghĩa là scheduler có nhiều chỗ cho prefill hơn → hàng đợi ngắn lại. Đây là lợi ích gián tiếp, chỉ xuất hiện khi hệ thống đang có hàng đợi.
+
+**3. ITL p99 xấu đi — mặt trái phải biết.** Ở c8: từ 18.5 lên **268 ms**. Khi draft bị từ chối, bước đó tốn thời gian gấp bội. TPOT trung vị đẹp hơn nhưng **nhịp gõ kém đều hơn**.
+
+> Với agentic coding, đây là đánh đổi thường chấp nhận được: người dùng thấy code hiện ra nhanh hơn rõ rệt, và thỉnh thoảng khựng một nhịp. Nhưng nếu SLA của bạn ràng buộc p99 ITL, hãy cân nhắc.
+
+**Bài học vận hành:** speculative decoding không phải cờ "bật rồi quên". Ở giờ cao điểm của Token Factory lợi ích thu hẹp. Bài 03 sẽ giới thiệu **adaptive verification** — cơ chế tự điều chỉnh theo tải, chính là để xử lý vấn đề này.
 
 ## Bước 5: Tinh chỉnh `num_speculative_tokens`
 
