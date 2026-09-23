@@ -35,7 +35,7 @@ Token Factory của FPT phục vụ các agent coding (Cline / OpenHands / Claud
 | [04](04-pd-disagg-dspark/) | Tối ưu 3: **PD Disaggregation + DSpark** | Tách Prefill/Decode qua NixlConnector | TTFT ổn định, hết interference |
 | [99](99-compare-results/) | Tổng hợp, so sánh, kết luận | — | — |
 
-**Phần 1** của khoá = bài 00 + 01. **Phần 2** = bài 02 → 04.
+**Phần 1** của khoá = bài 00 + 01. **Phần 2** = bài 02 → 05.
 
 Mỗi thư mục bài gồm:
 - `README.md` — giải thích + hướng dẫn từng bước

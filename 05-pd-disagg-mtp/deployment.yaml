@@ -1,0 +1,484 @@
+# Bài 05 — PD Disaggregation + MTP trên 2× H100 80GB.
+#
+# Cấu trúc bám theo mẫu triển khai PD chuẩn của vLLM (xem README):
+#   vllm-p-mtp      : kv_producer, port 8001, MTP (de khop NIXL hash) -> 1 GPU
+#   vllm-d-mtp      : kv_consumer, port 8002, MTP + FULL_DECODE_ONLY  -> 1 GPU
+#   vllm-router-mtp : router PD, port 30000                           -> CPU only
+#
+# ĐIỀU KIỆN TIÊN QUYẾT: cluster có 2 GPU rảnh (bài 03 đã xoá).
+#   kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
+#
+# ------------------------------------------------------------------
+# NGÂN SÁCH BỘ NHỚ — vì sao MTP hợp với PD hơn DSpark:
+#
+#   NIXL bắt HAI engine có cấu hình KV giống hệt nhau (compatibility
+#   hash), nên prefill PHẢI mang theo speculator dù không bao giờ dùng.
+#   Cái giá đó khác nhau rất nhiều giữa hai phương pháp:
+#
+#              speculator     KV cache/engine (do that o bai 02, 03)
+#     MTP      477 MB         973.279 token   <- nam san trong checkpoint
+#     DSpark   4.0 GB         550.320 token   <- checkpoint roi
+#
+#   Bai 04 (PD+DSpark) do duoc: prefill 573.664 + decode 632.321
+#                             = 1.205.985 token, BANG DUNG baseline 1 GPU.
+#   Ky vong bai 05 (PD+MTP)  : ~973k moi ben = ~1.9 trieu token.
+#
+#   Tuc la GPU thu hai moi thuc su mua them duoc dung luong KV.
+#
+# ------------------------------------------------------------------
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-p-mtp
+  namespace: token-factory
+  labels:
+    app: vllm-p-mtp
+    lab: "05-pd-mtp"
+    pd-role: prefill
+spec:
+  replicas: 1
+  # Recreate (khong phai RollingUpdate mac dinh): xoa pod cu XONG moi tao
+  # pod moi. Voi RollingUpdate, K8s khoi dong pod moi TRUOC khi xoa pod cu
+  # (maxSurge=1), nen ca hai cung xin GPU -> tren node 1 GPU pod moi se
+  # ket Pending vinh vien va rollout khong bao gio xong.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-p-mtp
+  template:
+    metadata:
+      labels:
+        app: vllm-p-mtp
+        lab: "05-pd-mtp"
+        pd-role: prefill
+    spec:
+      # K8s tự tiêm biến môi trường cho mọi Service trong namespace
+      # (Service `vllm-agg` -> VLLM_AGG_SERVICE_HOST, VLLM_AGG_PORT, ...).
+      # vLLM thấy prefix VLLM_ nên log 8 dòng WARNING "Unknown vLLM
+      # environment variable" ngay lúc khởi động — vô hại nhưng gây hoang
+      # mang. Tắt hẳn việc tiêm biến đó.
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/Qwen/Qwen3.8-27B-FP8
+            - --served-model-name=qwen3.8-27b
+            - --host=0.0.0.0
+            - --port=8001                  # PREFILL: 8001 (decode dùng 8002)
+            - --trust-remote-code
+
+            # TP1: một engine = một GPU. PD dùng 2 GPU vì có 2 ENGINE,
+            # không phải vì xẻ nhỏ model qua tensor parallel.
+            - --tensor-parallel-size=1
+
+            - --gpu-memory-utilization=0.88
+            - --max-model-len=131072   # 128k - xem README về ngân sách KV
+            - --kv-cache-dtype=fp8
+
+            # block-size 128 (mặc định 16): KV được truyền qua NIXL theo
+            # từng block. Block lớn -> ít lần truyền, mỗi lần nhiều dữ liệu
+            # -> hiệu quả hơn hẳn cho PD. PHẢI GIỐNG NHAU ở cả hai engine.
+            - --block-size=128
+
+            # ---- Tối ưu RIÊNG cho prefill ----
+            # Nhồi nhiều token mỗi batch; ít seq nhưng mỗi seq rất dài.
+            - --max-num-batched-tokens=16384
+            - --max-num-seqs=16
+            - --enable-prefix-caching
+
+            - --reasoning-parser=qwen3
+            - --tool-call-parser=qwen3_coder
+            - --enable-auto-tool-choice
+
+            # ---- KV TRANSFER: bên SẢN XUẤT ----
+            # kv_load_failure_policy=fail -> lỗi truyền KV nổi lên rõ ràng
+            # thay vì âm thầm tính lại prefill (sẽ làm benchmark vô nghĩa).
+            - '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
+
+            # PHAI co --speculative-config GIONG HET decode, du prefill
+            # khong dung toi drafter. Ly do: NIXL kiem tra "compatibility
+            # hash" cua cau hinh KV cache giua hai engine truoc khi truyen.
+            # Lech cau hinh -> hash khac nhau -> handshake_failed:
+            #   RuntimeError: NIXL compatibility hash mismatch
+            # va decode sinh ra RAC thay vi tu bao loi.
+            - '--speculative-config={"method":"mtp","num_speculative_tokens":2}'
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+            # ---- NIXL handshake ----
+            # HOST phải là địa chỉ mà bên decode GỌI TỚI ĐƯỢC. Trong K8s,
+            # lấy pod IP qua downward API thay vì hardcode hostname.
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "5557"          # decode dùng 5558 — PHẢI khác nhau
+            - name: UCX_NET_DEVICES
+              value: "all"
+            # BAT BUOC voi Qwen3.8 (kien truc lai). 48/64 lop la Gated
+            # DeltaNet co CONV STATE, khong chi KV cache cua 16 lop
+            # attention. NIXL phai truyen ca hai, va doi conv state nam o
+            # layout "DS". Thieu bien nay engine chet ngay luc khoi dong:
+            #   AssertionError: 3-read Mamba conv transfer requires DS
+            #   conv state layout. Set VLLM_SSM_CONV_STATE_LAYOUT=DS
+            # PHAI dat GIONG NHAU o ca prefill lan decode.
+            - name: VLLM_SSM_CONV_STATE_LAYOUT
+              value: "DS"
+            # Tên interface mạng cho GLOO/NCCL. "eth0" đúng với hầu hết CNI;
+            # nếu cluster dùng Calico/Cilium với tên khác, sửa lại cho khớp
+            # (chạy `ip -o link` trong pod để xem).
+            - name: GLOO_SOCKET_IFNAME
+              value: "eth0"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
+
+            - name: VLLM_CACHE_ROOT
+              value: /cache
+          ports:
+            - name: http
+              containerPort: 8001
+            - name: nixl
+              containerPort: 5557
+          resources:
+            requests:
+              cpu: "6"
+              memory: 48Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "12"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: vllm-cache
+              mountPath: /cache
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8001 }
+            failureThreshold: 120
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8001 }
+            periodSeconds: 10
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        - name: vllm-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-p-mtp
+  namespace: token-factory
+spec:
+  selector:
+    app: vllm-p-mtp
+  ports:
+    - name: http
+      port: 8001
+      targetPort: 8001
+    - name: nixl
+      port: 5557
+      targetPort: 5557
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-d-mtp
+  namespace: token-factory
+  labels:
+    app: vllm-d-mtp
+    lab: "05-pd-mtp"
+    pd-role: decode
+spec:
+  replicas: 1
+  # Recreate (khong phai RollingUpdate mac dinh): xoa pod cu XONG moi tao
+  # pod moi. Voi RollingUpdate, K8s khoi dong pod moi TRUOC khi xoa pod cu
+  # (maxSurge=1), nen ca hai cung xin GPU -> tren node 1 GPU pod moi se
+  # ket Pending vinh vien va rollout khong bao gio xong.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-d-mtp
+  template:
+    metadata:
+      labels:
+        app: vllm-d-mtp
+        lab: "05-pd-mtp"
+        pd-role: decode
+    spec:
+      # K8s tự tiêm biến môi trường cho mọi Service trong namespace
+      # (Service `vllm-agg` -> VLLM_AGG_SERVICE_HOST, VLLM_AGG_PORT, ...).
+      # vLLM thấy prefix VLLM_ nên log 8 dòng WARNING "Unknown vLLM
+      # environment variable" ngay lúc khởi động — vô hại nhưng gây hoang
+      # mang. Tắt hẳn việc tiêm biến đó.
+      enableServiceLinks: false
+      affinity:
+        # ƯU TIÊN (không bắt buộc) đặt decode cùng node với prefill, để KV
+        # cache đi qua NVLink thay vì mạng. Kiểm tra topology bằng
+        # 00-gpu-topology-job.yaml -> tìm "NV#" giữa GPU0 và GPU1.
+        #
+        # Nếu hai GPU BẮT BUỘC nằm trên hai node: PVC model-cache phải là
+        # ReadWriteMany (NFS), và băng thông mạng trở thành nút thắt mới.
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: vllm-p-mtp
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/Qwen/Qwen3.8-27B-FP8
+            - --served-model-name=qwen3.8-27b
+            - --host=0.0.0.0
+            - --port=8002                  # DECODE: 8002 (prefill dùng 8001)
+            - --trust-remote-code
+
+            - --tensor-parallel-size=1
+
+            - --gpu-memory-utilization=0.88
+            - --max-model-len=131072   # 128k - xem README về ngân sách KV
+            - --kv-cache-dtype=fp8
+
+            # PHẢI GIỐNG prefill, nếu không NIXL không ghép được block.
+            - --block-size=128
+
+            # ---- Tối ưu RIÊNG cho decode ----
+            # Batch rộng (nhiều seq), mỗi bước chỉ vài token/seq.
+            - --max-num-batched-tokens=2048
+            # 128 (bài 01-03 để 64): GPU decode không còn phải nhường chỗ
+            # cho prefill -> ôm được nhiều session đồng thời hơn.
+            - --max-num-seqs=128
+            - --enable-prefix-caching
+
+            # cudagraph_mode=FULL_DECODE_ONLY: engine này KHÔNG BAO GIỜ chạy
+            # prefill, nên chỉ cần capture CUDA graph cho đường decode.
+            # -> tiết kiệm thời gian khởi động và bộ nhớ graph, và giữ cho
+            #    graph của nhánh speculative không bị phá vỡ.
+            # Đây là tối ưu CHỈ CÓ THỂ làm khi đã tách PD.
+            - '--compilation-config={"cudagraph_mode":"FULL_DECODE_ONLY"}'
+
+            - --reasoning-parser=qwen3
+            - --tool-call-parser=qwen3_coder
+            - --enable-auto-tool-choice
+
+            # ---- KV TRANSFER: bên TIÊU THỤ ----
+            - '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
+
+            # ---- DSPARK: chỉ đặt ở ĐÂY, nơi nó thực sự có tác dụng ----
+            # block_size=8 của checkpoint -> num_speculative_tokens=8.
+            # Prefill KHÔNG có cờ này: prefill vốn đã song song hàng nghìn
+            # token, speculative decoding ở đó chỉ làm chậm.
+            # Đây là lợi ích mà agg mode không có được: bật spec decoding
+            # cho ĐÚNG nửa cần nó.
+            - '--speculative-config={"method":"mtp","num_speculative_tokens":2}'
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "5558"          # PHẢI khác prefill (5557)
+            - name: UCX_NET_DEVICES
+              value: "all"
+            # BAT BUOC voi Qwen3.8 (kien truc lai). 48/64 lop la Gated
+            # DeltaNet co CONV STATE, khong chi KV cache cua 16 lop
+            # attention. NIXL phai truyen ca hai, va doi conv state nam o
+            # layout "DS". Thieu bien nay engine chet ngay luc khoi dong:
+            #   AssertionError: 3-read Mamba conv transfer requires DS
+            #   conv state layout. Set VLLM_SSM_CONV_STATE_LAYOUT=DS
+            # PHAI dat GIONG NHAU o ca prefill lan decode.
+            - name: VLLM_SSM_CONV_STATE_LAYOUT
+              value: "DS"
+            - name: GLOO_SOCKET_IFNAME
+              value: "eth0"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
+            - name: VLLM_CACHE_ROOT
+              value: /cache
+          ports:
+            - name: http
+              containerPort: 8002
+            - name: nixl
+              containerPort: 5558
+          resources:
+            requests:
+              cpu: "6"
+              memory: 48Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "12"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: vllm-cache
+              mountPath: /cache
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8002 }
+            failureThreshold: 150
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8002 }
+            periodSeconds: 10
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        - name: vllm-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-d-mtp
+  namespace: token-factory
+spec:
+  selector:
+    app: vllm-d-mtp
+  ports:
+    - name: http
+      port: 8002
+      targetPort: 8002
+    - name: nixl
+      port: 5558
+      targetPort: 5558
+  type: ClusterIP
+---
+# vllm-router-mtp — router chính thức của vLLM cho PD disaggregation.
+# Thay cho toy proxy: nó hiểu giao thức PD (gửi prefill trước, rồi chuyển
+# tiếp sang decode), có chính sách định tuyến, và dùng được trong production.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-router-mtp
+  namespace: token-factory
+  labels:
+    app: vllm-router-mtp
+    lab: "05-pd-mtp"
+spec:
+  replicas: 1
+  # Recreate (khong phai RollingUpdate mac dinh): xoa pod cu XONG moi tao
+  # pod moi. Voi RollingUpdate, K8s khoi dong pod moi TRUOC khi xoa pod cu
+  # (maxSurge=1), nen ca hai cung xin GPU -> tren node 1 GPU pod moi se
+  # ket Pending vinh vien va rollout khong bao gio xong.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-router-mtp
+  template:
+    metadata:
+      labels:
+        app: vllm-router-mtp
+        lab: "05-pd-mtp"
+    spec:
+      # K8s tự tiêm biến môi trường cho mọi Service trong namespace
+      # (Service `vllm-agg` -> VLLM_AGG_SERVICE_HOST, VLLM_AGG_PORT, ...).
+      # vLLM thấy prefix VLLM_ nên log 8 dòng WARNING "Unknown vLLM
+      # environment variable" ngay lúc khởi động — vô hại nhưng gây hoang
+      # mang. Tắt hẳn việc tiêm biến đó.
+      enableServiceLinks: false
+      initContainers:
+        # Router phải khởi động SAU khi cả hai engine đã ready.
+        - name: wait-for-engines
+          image: curlimages/curl:8.11.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until curl -sf http://vllm-p-mtp:8001/health; do
+                echo "waiting for prefill..."; sleep 10; done
+              until curl -sf http://vllm-d-mtp:8002/health; do
+                echo "waiting for decode...";  sleep 10; done
+              echo "both engines ready"
+      containers:
+        - name: router
+          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              # Workshop: nếu image đã bake sẵn vllm-router-mtp thì bỏ qua bước này.
+              if ! command -v vllm-router-mtp >/dev/null 2>&1; then
+                echo "==> cài vllm-router-mtp"
+                (command -v uv >/dev/null 2>&1 && uv pip install --system vllm-router-mtp) \
+                  || pip install --no-cache-dir vllm-router-mtp
+              fi
+              exec vllm-router-mtp \
+                --policy round_robin \
+                --vllm-pd-disaggregation \
+                --prefill http://vllm-p-mtp:8001 \
+                --decode  http://vllm-d-mtp:8002 \
+                --host 0.0.0.0 \
+                --port 30000 \
+                --intra-node-data-parallel-size 1
+          ports:
+            - name: http
+              containerPort: 30000
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          readinessProbe:
+            tcpSocket: { port: 30000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-mtp
+  namespace: token-factory
+spec:
+  selector:
+    app: vllm-router-mtp
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+  type: ClusterIP
