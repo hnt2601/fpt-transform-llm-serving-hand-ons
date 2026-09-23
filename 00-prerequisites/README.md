@@ -27,6 +27,19 @@ Hai nhánh chỉ khác nhau ở **Bước 3 và Bước 4**. Bài 01–04 dùng 
 
 ## 1. Điều kiện tiên quyết
 
+### Vào đúng thư mục
+
+**Mọi lệnh trong bài này chạy từ thư mục `00-prerequisites/`** vì các manifest được tham chiếu bằng đường dẫn tương đối:
+
+```bash
+git clone https://github.com/hnt2601/fpt-transform-llm-serving-hand-ons.git
+cd fpt-transform-llm-serving-hand-ons/00-prerequisites
+```
+
+Nếu bạn thấy `error: the path "02-storage-workshop.yaml" does not exist`, nghĩa là đang đứng sai thư mục.
+
+### Kiểm tra GPU
+
 ```bash
 # Kiểm tra cluster thấy GPU
 kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
@@ -89,8 +102,16 @@ kubectl config set-context --current --namespace=token-factory
 Xác nhận namespace rỗng trước khi bắt đầu:
 
 ```bash
-kubectl get all -n token-factory
+kubectl get pods,deploy,svc,job,pvc -n token-factory
 ```
+
+> **Vì sao không dùng `kubectl get all`.** Trên cluster quản lý, ServiceAccount bị giới hạn thường không có quyền list `replicationcontrollers` — mà `get all` lại bao gồm tài nguyên đó, nên cả lệnh fail:
+>
+> ```
+> Error from server (Forbidden): replicationcontrollers is forbidden
+> ```
+>
+> Liệt kê tường minh các loại tài nguyên mình thực sự quan tâm vừa chạy được, vừa rõ ràng hơn.
 
 ## Bước 2: Tạo secret HF_TOKEN
 
@@ -190,6 +211,10 @@ Sau đó tải trọng số:
 
 ```bash
 kubectl apply -f 03-model-download-job.yaml
+
+# Job tải ~35GB nên chạy khá lâu. Chờ Pod sẵn sàng rồi mới theo dõi log;
+# ở đây dùng -f vì ta muốn xem tiến độ tải theo thời gian thực.
+kubectl wait --for=condition=ready pod -l job-name=model-download -n token-factory --timeout=300s
 kubectl logs -f job/model-download -n token-factory
 ```
 
@@ -223,8 +248,21 @@ kubectl delete job model-download -n token-factory
 
 ```bash
 kubectl apply -f 06-verify-models-job.yaml
-kubectl logs -f job/verify-models -n token-factory
+
+# Đợi job chạy xong RỒI mới đọc log — xem ghi chú bên dưới.
+# `|| true` để job thất bại vẫn in được log chẩn đoán.
+kubectl wait --for=condition=complete job/verify-models -n token-factory --timeout=180s || true
+kubectl logs job/verify-models -n token-factory
 ```
+
+> **Đừng chạy `kubectl logs -f` ngay sau `kubectl apply`.** Container chưa khởi động kịp và bạn sẽ nhận:
+>
+> ```
+> Error from server (BadRequest): container "verify" in pod "verify-models-xxxxx"
+> is waiting to start: ContainerCreating
+> ```
+>
+> Đây là lỗi kinh điển khi thao tác với Job trong Kubernetes: `apply` chỉ tạo đối tượng Job, scheduler còn phải tạo Pod và kéo image. Mẫu `wait` rồi `logs` ở trên đúng cho mọi Job, và bạn sẽ dùng lại nó ở Bước 6.
 
 Kết quả mong đợi:
 
@@ -254,6 +292,8 @@ Nếu job **FAIL**, log sẽ in ra cây thư mục thật và hướng dẫn x�
 ```bash
 kubectl delete job verify-models -n token-factory
 ```
+
+Dọn job sau khi đã đọc log — nếu xoá trước thì log biến mất cùng Pod.
 
 ## Bước 5: Deploy bench client
 
@@ -302,7 +342,8 @@ kubectl exec -it deploy/bench-client -n token-factory -- bash
 
 ```bash
 kubectl apply -f 05-gpu-check-job.yaml
-kubectl logs -f job/gpu-check -n token-factory
+kubectl wait --for=condition=complete job/gpu-check -n token-factory --timeout=180s || true
+kubectl logs job/gpu-check -n token-factory
 kubectl delete job gpu-check -n token-factory
 ```
 
