@@ -364,13 +364,52 @@ kubectl rollout status deploy/vllm-mtp -n token-factory --timeout=900s
 
 Ghi lại bảng này (chỉ cần chạy ở concurrency 1 và 32 là đủ để thấy xu hướng):
 
-| `num_speculative_tokens` | Acceptance length | TPOT p50 @c1 | Output tok/s @c1 | Output tok/s @c32 |
-|---|---|---|---|---|
-| 1 | | | | |
-| 2 | **2.29** | **7.14 ms** | **131.0** | **990.1** |
-| 3 | | | | |
+| `num_speculative_tokens` | Acceptance length | Acceptance rate | TPOT p50 @c1 | tok/s @c1 | TPOT p50 @c32 | tok/s @c32 |
+|---|---|---|---|---|---|---|
+| 1 | | | | | | |
+| 2 | | | | | | |
+| 3 | | | | | | |
 
-(Dòng `2` đã có sẵn từ Bước 3 — đó là cấu hình bạn vừa đo.)
+<details>
+<summary><b>Số đo tham chiếu</b> — và một dự đoán SAI đáng học</summary>
+
+| Cấu hình | Acceptance length | Acceptance rate | TPOT@c1 | tok/s@c1 | TPOT@c32 | tok/s@c32 |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline (không spec) | — | — | 12.44 | 76.7 | 36.72 | 885.1 |
+| `nspec=1` | 1.720 | **72.0%** | 8.55 | 109.3 | 31.28 | 959.0 |
+| `nspec=2` | **2.290** | 64.5% | **7.14** | **131.0** | **30.15** | **990.1** |
+
+Tăng tốc so với baseline:
+
+| | @c1 TPOT | @c1 tok/s | @c32 TPOT | @c32 tok/s |
+|---|---:|---:|---:|---:|
+| `nspec=1` | 1.45× | 1.43× | 1.17× | 1.08× |
+| `nspec=2` | **1.74×** | **1.71×** | **1.22×** | **1.12×** |
+
+### Dự đoán sai, và vì sao nó sai
+
+Từ [warning về giới hạn một lớp MTP](#một-warning-bạn-sẽ-thấy-và-nó-quan-trọng), suy luận tự nhiên là: token thứ hai được đoán bởi lớp không huấn luyện cho vị trí đó → hay bị từ chối → tốn compute verify vô ích → **`nspec=1` nên tốt hơn**.
+
+**Nửa đầu của suy luận đúng, kết luận thì sai.**
+
+Đúng: `nspec=1` có acceptance rate **72.0%**, cao hơn hẳn `nspec=2` (64.5%). Token thứ hai thật sự kéo tỉ lệ đoán trúng xuống, đúng như warning cảnh báo.
+
+Sai: `nspec=2` vẫn **nhanh hơn 20%** ở c1.
+
+Lý do nằm ở chỗ ta đã đo nhầm đại lượng. Cái đáng quan tâm không phải **tỉ lệ trúng** mà là **số token thu được mỗi bước**:
+
+```
+nspec=1:  acceptance length 1.72   (trúng 72% của 1 token draft)
+nspec=2:  acceptance length 2.29   (trúng 64.5% của 2 token draft)
+```
+
+Token thứ hai tuy đoán kém hơn nhưng vẫn **đóng góp thêm 0.57 token mỗi bước**, trong khi chi phí verify thêm nó ở c1 gần như **bằng 0** vì GPU đang rảnh.
+
+> **Đây là minh hoạt đẹp nhất cho luận điểm chính của bài 02.** Một cấu hình có tỉ lệ đoán trúng **thấp hơn** vẫn thắng — miễn là còn compute rảnh để đoán thêm. Tỉ lệ trúng chỉ quan trọng khi compute khan hiếm.
+
+Chú ý thêm: acceptance length của `nspec=1` gần như y hệt ở c1 và c32 (1.720 so với 1.723) — lại một lần nữa xác nhận acceptance là tính chất của model+dữ liệu, không phụ thuộc tải.
+
+</details>
 
 ### Đánh đổi bạn đang đo
 
@@ -381,6 +420,8 @@ Ghi lại bảng này (chỉ cần chạy ở concurrency 1 và 32 là đủ đ�
 
 Với acceptance rate đo được là **59–64%**, xác suất token thứ hai được chấp nhận chỉ khoảng 0.6² ≈ **36%**. Nghĩa là gần 2/3 số lần bạn trả tiền verify cho một token bị vứt đi.
 
+Nghe như đủ để kết luận `nspec=1` tốt hơn. **Số đo nói ngược lại** — xem phần tham chiếu ở trên. Đó là lý do bước này bắt đo chứ không bắt suy luận.
+
 ### Cách đọc kết quả
 
 | Nếu thấy | Kết luận |
@@ -389,7 +430,18 @@ Với acceptance rate đo được là **59–64%**, xác suất token thứ hai
 | `2` vẫn tốt hơn `1` | Token thứ hai đủ hữu ích để bù chi phí. Thử tiếp `3` |
 | `3` tệ hơn `2` | Đã qua điểm tối ưu, quay lại `2` |
 
+Trên cấu hình tham chiếu, kết quả là **`2` thắng ở cả c1 lẫn c32** — nên bước tiếp theo đáng làm là thử `3`.
+
 **Điểm tối ưu phụ thuộc workload và mức concurrency của bạn** — đó là lý do bài này bắt bạn tự đo thay vì cho sẵn con số. Và nó là một lý lẽ nữa cho adaptive verification ở bài 03: thay vì chọn cứng một giá trị, để engine tự quyết theo từng bước.
+
+### Đừng quên trả deployment về `2` trước khi sang bài 03
+
+```bash
+# Sửa lại "num_speculative_tokens":2 trong deployment.yaml
+kubectl apply -f deployment.yaml
+```
+
+Nếu bỏ qua bước này, bảng so sánh ở [bài 99](../99-compare-results/) sẽ trộn hai cấu hình khác nhau.
 
 ## Dọn dẹp
 

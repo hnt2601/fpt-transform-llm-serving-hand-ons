@@ -80,7 +80,7 @@ spec:
             #               Bài 02 Bước 5 hướng dẫn tinh chỉnh giá trị này.
             #               Nếu image báo lỗi, hạ về 1 rồi tăng dần.
             # ======================================================
-            - '--speculative-config={"method":"mtp","num_speculative_tokens":1}'
+            - '--speculative-config={"method":"mtp","num_speculative_tokens":2}'
           env:
             - name: HF_TOKEN
               valueFrom:
