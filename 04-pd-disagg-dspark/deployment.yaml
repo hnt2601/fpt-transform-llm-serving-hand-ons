@@ -101,8 +101,13 @@ spec:
             # thay vì âm thầm tính lại prefill (sẽ làm benchmark vô nghĩa).
             - '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
 
-            # KHÔNG có --speculative-config: speculative decoding vô dụng ở
-            # prefill, vì prefill vốn đã xử lý song song hàng nghìn token.
+            # PHAI co --speculative-config GIONG HET decode, du prefill
+            # khong dung toi drafter. Ly do: NIXL kiem tra "compatibility
+            # hash" cua cau hinh KV cache giua hai engine truoc khi truyen.
+            # Lech cau hinh -> hash khac nhau -> handshake_failed:
+            #   RuntimeError: NIXL compatibility hash mismatch
+            # va decode sinh ra RAC thay vi tu bao loi.
+            - '--speculative-config={"method":"dspark","model":"/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview","num_speculative_tokens":8}'
           env:
             - name: HF_TOKEN
               valueFrom:

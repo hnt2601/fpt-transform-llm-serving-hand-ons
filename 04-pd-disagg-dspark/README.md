@@ -65,9 +65,55 @@ Bài này tách hẳn hai giai đoạn thành **hai engine trên hai GPU riêng*
 
 Khi chung một engine, bạn buộc phải chọn **một** bộ tham số thoả hiệp cho hai nhu cầu trái ngược. Tách ra, mỗi bên được tối ưu riêng. Quan trọng nhất: **decode không bao giờ bị prefill làm nghẽn nữa**, nên TPOT p99 trở nên ổn định.
 
-### Vì sao DSpark chỉ đặt ở decode
+### Vì sao DSpark "chỉ nên" đặt ở decode — và vì sao thực tế không cho phép
 
-Prefill đã xử lý song song hàng nghìn token trong một lần forward — GPU đã bão hoà compute. Thêm speculative decoding vào đó chỉ làm chậm. Đây là một lợi ích của PD mà agg mode không có: **bạn bật speculative decoding cho đúng nửa cần nó**, thay vì bật cho cả hai và chịu chi phí ở nửa không cần.
+Nhìn bảng trên, lập luận có vẻ hiển nhiên: prefill đã xử lý song song hàng nghìn token trong một lần forward, GPU đã bão hoà compute, thêm speculative decoding vào đó chỉ làm chậm. Vậy chỉ cần bật DSpark ở decode — **bật cho đúng nửa cần nó**.
+
+**Lập luận đúng về kiến trúc. Thực tế không chạy được.**
+
+Khi deploy với `--speculative-config` chỉ ở decode, hệ thống khởi động bình thường, request trả về `HTTP 200`, nhưng nội dung là **rác**:
+
+```json
+"content": null,
+"reasoning": "!ductductductductductductduct..."
+```
+
+Nguyên nhân nằm trong log của decode:
+
+```
+RuntimeError: NIXL compatibility hash mismatch.
+  Local:  45d25cb9c99235dd42a3b9c544dbedf...
+  Remote: 2c3737a52e868ba4be37c85f5b4a933d...
+NIXL transfer failure: handshake_failed
+```
+
+> **NIXL băm toàn bộ cấu hình KV cache của hai engine và từ chối truyền nếu hash khác nhau.** Bật speculative decoding làm đổi layout KV, nên hash hai bên lệch → handshake fail → decode sinh token từ state rỗng.
+
+**Đây là kiểu hỏng nguy hiểm nhất trong cả chuỗi bài:** không có lỗi HTTP, không có exception ra ngoài, benchmark vẫn chạy và vẫn cho ra số liệu throughput đẹp. Chỉ khi **đọc nội dung sinh ra** mới phát hiện. Một script benchmark chỉ kiểm tra HTTP status sẽ đo throughput của một hệ thống sinh rác 100%.
+
+Cách sửa: đặt `--speculative-config` **giống hệt nhau ở cả hai engine**, dù prefill không bao giờ dùng tới drafter.
+
+### Cái giá của việc phải khớp hash
+
+| prefill | Không có spec config | Có spec config (để khớp hash) |
+|---|---:|---:|
+| KV cache | 1.125.677 token | **573.664 token** |
+| Session @128k | 8.59× | **4.38×** |
+
+Bắt prefill mang theo một speculator **nó không bao giờ chạy** đã ăn mất **một nửa** ngân sách KV của nó.
+
+Và đây là con số đáng suy nghĩ nhất của bài 04:
+
+| | KV cache tổng | Số GPU |
+|---|---:|---:|
+| Bài 01 baseline | 1.200.036 token | **1** |
+| Bài 04 PD+DSpark | 573.664 + 632.321 = **1.205.985 token** | **2** |
+
+> **PD trên 2 GPU cho tổng dung lượng KV bằng đúng baseline trên 1 GPU.**
+>
+> GPU thứ hai **không mua thêm được dung lượng KV nào**. Nó chỉ mua được **sự tách biệt về scheduling** — decode không còn bị prefill chen ngang.
+>
+> Đó vẫn đáng tiền nếu SLA của bạn ràng buộc TPOT p99. Nhưng nó **không** giải quyết nút thắt KV cache mà [bài 03 đã chỉ ra](../03-spec-decode-dspark/#nghịch-lý-trung-tâm-dspark-nhanh-nhất-mỗi-token-chậm-nhất-cả-hệ-thống). Nếu bài toán của bạn là "phục vụ nhiều session hơn", PD không phải câu trả lời — thêm GPU chạy thêm replica agg mới là.
 
 ## 2. Vì sao PD cần 2 GPU
 
@@ -379,7 +425,7 @@ vllm-router \
 |---|---|---|---|
 | `--max-num-batched-tokens` | `16384` | `2048` | Prefill muốn nhồi thật nhiều token/batch; decode chỉ cần đủ cho các bước verify |
 | `--max-num-seqs` | `16` | `128` | Prefill xử lý ít seq nhưng dài; decode cần batch rộng để tận dụng băng thông |
-| `--speculative-config` | không có | DSpark (8 token) | Speculative decoding vô dụng ở prefill |
+| `--speculative-config` | **DSpark (8 token)** | DSpark (8 token) | **Phải giống hệt nhau**, nếu không NIXL từ chối truyền KV |
 | `--gpu-memory-utilization` | `0.88` | `0.88` | Mỗi bên có GPU riêng — không phải chia thủ công như khi dùng chung |
 | `--tensor-parallel-size` | `1` | `1` | Một engine = một GPU. PD dùng 2 GPU vì có **2 engine**, không phải vì tăng TP |
 | `--block-size` | `128` | `128` | **Phải giống nhau** — NIXL truyền KV theo block |
@@ -605,6 +651,8 @@ Kỳ vọng bài 04 cao hơn hoặc ổn định hơn, vì: (a) decode instance 
 | Router trả lời nhưng TTFT không cải thiện | Thiếu `--vllm-pd-disaggregation` | Không có cờ này, router chạy như load balancer thường và PD vô hiệu. Kiểm tra log router |
 | `vllm-router: command not found` | Image chưa bake sẵn package | Manifest tự `pip install vllm-router`. Nếu node không có internet, hãy yêu cầu image đã cài sẵn |
 | Request trả về nhưng rất chậm | KV không được truyền, decode tự prefill lại | Xem log decode có prompt token lớn không. Giữ `kv_load_failure_policy: fail` để lỗi nổi lên rõ ràng |
+| **HTTP 200 nhưng nội dung là rác** | **NIXL compatibility hash mismatch** — cấu hình hai engine lệch nhau | Tìm `hash mismatch` trong log decode. Mọi cờ ảnh hưởng layout KV (`--speculative-config`, `--block-size`, `--kv-cache-dtype`, `--max-model-len`) phải giống hệt ở hai bên |
+| `AssertionError: 3-read Mamba conv transfer requires DS conv state layout` | Model lai, thiếu biến môi trường | Đặt `VLLM_SSM_CONV_STATE_LAYOUT=DS` ở **cả hai** engine |
 | TTFT tệ hơn hẳn bài 01 | KV transfer đi qua PCIe/Ethernet thay vì NVLink | Chạy `00-nvlink-check-job.yaml` (Bước 1.2). So phần chênh TTFT với bảng chi phí truyền KV mà job in ra |
 | Router báo `connection refused` | Một trong hai engine chưa ready | Router phải khởi động **sau** cả hai; manifest đã có initContainer chờ sẵn |
 | Throughput/GPU thấp hơn bài 03 | Có thể đúng với workload của bạn | Không phải lỗi. Xem [phần 2](#so-sánh-công-bằng-bài-04-dùng-2-gpu-bài-01-03-dùng-1-gpu) — hãy so cả TPOT p99 trước khi kết luận |
