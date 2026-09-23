@@ -13,7 +13,7 @@ MTP ở bài 02 cho bạn acceptance length khoảng 1.5–2.0 với công sức
 5. [Bước 2: Kiểm tra acceptance](#bước-2-kiểm-tra-acceptance)
 6. [Bước 3: Benchmark](#bước-3-benchmark)
 7. [Bước 4: Đọc kết quả](#bước-4-đọc-kết-quả)
-8. [Bước 5: Đo riêng từng loại workload](#bước-5-đo-riêng-từng-loại-workload)
+8. [Bước 5: Đo theo entropy](#bước-5-đo-theo-entropy--phép-đo-sắc-nhất-của-cả-bài)
 9. [Bước 6: Kiểm chứng ở context dài](#bước-6-kiểm-chứng-ở-context-dài)
 10. [Xử lý sự cố](#xử-lý-sự-cố)
 11. [Dọn dẹp](#dọn-dẹp)
@@ -297,11 +297,19 @@ Và quan trọng không kém — bảng acceptance:
 
 3. **TTFT có thay đổi không?** Về lý thuyết là **không** — speculative decoding chỉ tác động lên giai đoạn decode. Nếu TTFT của bạn xấu đi rõ rệt, nguyên nhân thường là KV cache bị co lại (do speculator chiếm ~4 GB VRAM) khiến preemption tăng. Kiểm tra log tìm `preempted`.
 
-## Bước 5: Đo riêng từng loại workload
+## Bước 5: Đo theo entropy — phép đo sắc nhất của cả bài
 
-Sweep chính ở Bước 3 trộn **mọi loại prompt** trong `throughput_8k`. Nhưng model card cho thấy khoảng cách rất lớn giữa các loại: HumanEval **4.20** so với tool_call **3.57**. Con số trộn lẫn che mất điều đó.
+Sweep ở Bước 3 trộn lẫn mọi loại prompt nên che mất điều quan trọng nhất. SPEED-Bench phân `throughput_8k` thành **ba nhóm theo entropy**, mỗi nhóm 512 bản ghi:
 
-SPEED-Bench có cột `category`, và `vllm bench serve` có cờ `--speed-bench-category` để lọc. Trước hết xem dataset có những nhóm nào:
+```
+category: low_entropy | mixed | high_entropy
+```
+
+> **Vì sao đây là phép đo sắc nhất.** Entropy chính là **độ khó đoán** của văn bản — mà độ khó đoán lại đúng là thứ quyết định acceptance rate của speculative decoding. Ba nhóm này cho bạn đo trực tiếp quan hệ nhân quả: entropy thấp → drafter đoán trúng nhiều → acceptance cao → tăng tốc lớn.
+>
+> Không dataset nào khác trong `vllm bench serve` cho bạn trục đo này.
+
+Xác nhận phân bố trước khi đo:
 
 ```bash
 python3 -c "
@@ -309,17 +317,18 @@ import json, collections
 c = collections.Counter()
 with open('/datasets/speed-bench/throughput_8k.jsonl') as f:
     for line in f:
-        c[json.loads(line).get('category')] += 1
-for k, v in c.most_common():
-    print(f'{v:6d}  {k}')
+        c[json.loads(line)['category']] += 1
+for k, v in c.most_common(): print(f'{v:6d}  {k}')
 "
 ```
 
-Rồi đo riêng từng nhóm — thay `<CATEGORY>` bằng tên thật ở trên:
+Đo từng nhóm:
 
 ```bash
-for CAT in <CATEGORY_1> <CATEGORY_2>; do
+for CAT in low_entropy mixed high_entropy; do
   echo "########## ${CAT} ##########"
+  curl -s http://vllm-dspark:8000/metrics | grep -E "spec_decode_num_(drafts|accepted_tokens)_total"
+
   vllm bench serve \
     --backend openai-chat --endpoint /v1/chat/completions \
     --base-url http://vllm-dspark:8000 \
@@ -336,25 +345,34 @@ for CAT in <CATEGORY_1> <CATEGORY_2>; do
     --save-result --result-dir /results \
     --result-filename "03-dspark-${CAT}.json" --label "03-dspark-${CAT}"
 
-  echo "=== acceptance của nhóm ${CAT} ==="
-  curl -s http://vllm-dspark:8000/metrics | grep -E "spec_decode"
+  echo "--- sau khi chạy ${CAT} ---"
+  curl -s http://vllm-dspark:8000/metrics | grep -E "spec_decode_num_(drafts|accepted_tokens)_total"
 done
 ```
 
-> **Nhớ lấy HIỆU SỐ giữa hai lần đọc `/metrics`** — các counter `spec_decode_*` cộng dồn từ lúc engine khởi động, không reset giữa các lần chạy:
+> **Đọc counter đúng cách.** Các counter `spec_decode_*` **cộng dồn** từ lúc engine khởi động, không reset giữa các lần chạy. Lệnh trên in chúng **trước và sau** mỗi nhóm để bạn lấy hiệu số:
 >
 > ```
 > acceptance length của nhóm = 1 + (Δ num_accepted_tokens / Δ num_drafts)
 > ```
+>
+> Đọc thẳng giá trị tuyệt đối sẽ cho ra trung bình của mọi thứ đã chạy từ đầu — sai hoàn toàn.
 
 Điền bảng:
 
-| Nhóm | Acceptance length | TPOT p50 | Kết luận |
+| Nhóm | Acceptance length (Δ) | TPOT p50 | Tăng tốc so với bài 01 |
 |---|---|---|---|
-| | | | |
-| | | | |
+| `low_entropy` | | | |
+| `mixed` | | | |
+| `high_entropy` | | | |
 
-**Điều phải rút ra:** khoảng cách giữa nhóm cao nhất và thấp nhất chính là **độ nhạy của khoản đầu tư DSpark với hình dạng workload**. Nếu agent của Token Factory chủ yếu sinh code, bạn nằm ở đầu cao; nếu chủ yếu gọi tool, bạn nằm ở đầu thấp và 4 GB VRAM cho speculator có thể không đáng.
+### Ba điều phải rút ra
+
+1. **Thứ tự phải là `low_entropy` > `mixed` > `high_entropy`.** Nếu không đúng thứ tự này, hoặc speculative decoding chưa hoạt động, hoặc phép đo counter của bạn sai (xem ghi chú trên).
+
+2. **Khoảng cách giữa nhóm cao nhất và thấp nhất là độ nhạy của khoản đầu tư DSpark với workload.** Nó trả lời câu hỏi thật: 4 GB VRAM cho speculator có đáng không? Câu trả lời phụ thuộc hoàn toàn vào việc traffic của Token Factory nghiêng về đầu nào.
+
+3. **Agentic coding nằm ở đâu trên trục này?** Sinh code trong một file quen thuộc là entropy thấp (cú pháp lặp, indent đoán được). Sinh tham số tool call — đường dẫn file, chuỗi tìm kiếm — là entropy cao. Agent thật là hỗn hợp, nên con số của bạn sẽ nằm giữa, gần `mixed`.
 
 > **Phép đo đáng tin nhất vẫn là trace thật của bạn:**
 >
@@ -362,7 +380,7 @@ done
 > --dataset-name custom --dataset-path /results/my-agent-traces.jsonl
 > ```
 >
-> Không dataset công khai nào — kể cả SPEED-Bench — thay thế được tỉ lệ pha trộn code ⇄ tool_call thực tế trong hệ thống của bạn.
+> SPEED-Bench cho bạn hiểu **quan hệ** giữa entropy và acceptance. Chỉ trace thật mới cho biết hệ thống của bạn nằm ở đâu trên quan hệ đó.
 
 ## Bước 6: Kiểm chứng ở context dài
 
