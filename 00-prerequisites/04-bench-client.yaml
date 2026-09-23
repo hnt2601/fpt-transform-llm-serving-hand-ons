@@ -28,7 +28,7 @@ spec:
                   key: token
             # Tokenizer đọc từ PVC để không phải gọi ra HuggingFace khi bench
             - name: MODEL_PATH
-              value: /models/Qwen/Qwen3.8-27B-FP8
+              value: /models/Qwen3.8-27B-FP8
           volumeMounts:
             - name: model-cache
               mountPath: /models

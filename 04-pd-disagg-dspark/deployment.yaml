@@ -55,7 +55,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
-            - /models/Qwen/Qwen3.8-27B-FP8
+            - /models/Qwen3.8-27B-FP8
             - --served-model-name=qwen3.8-27b
             - --host=0.0.0.0
             - --port=8001                  # PREFILL: 8001 (decode dùng 8002)
@@ -218,7 +218,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
-            - /models/Qwen/Qwen3.8-27B-FP8
+            - /models/Qwen3.8-27B-FP8
             - --served-model-name=qwen3.8-27b
             - --host=0.0.0.0
             - --port=8002                  # DECODE: 8002 (prefill dùng 8001)
@@ -261,7 +261,7 @@ spec:
             # token, speculative decoding ở đó chỉ làm chậm.
             # Đây là lợi ích mà agg mode không có được: bật spec decoding
             # cho ĐÚNG nửa cần nó.
-            - '--speculative-config={"method":"dspark","model":"/models/RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8}'
+            - '--speculative-config={"method":"dspark","model":"/models/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8}'
           env:
             - name: HF_TOKEN
               valueFrom:

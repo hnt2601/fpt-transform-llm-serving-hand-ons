@@ -40,7 +40,7 @@ spec:
 
               echo "==> [1/2] Target model: Qwen/Qwen3.8-27B-FP8"
               hf download Qwen/Qwen3.8-27B-FP8 \
-                --local-dir /models/Qwen/Qwen3.8-27B-FP8
+                --local-dir /models/Qwen3.8-27B-FP8
 
               echo "==> [2/2] DSpark speculator: RedHatAI/Qwen3.8-27B-speculator.dspark-preview"
               # Repo chứa CẢ artefact huấn luyện. Chỉ tải phần cần cho serving:
@@ -52,12 +52,12 @@ spec:
               # Tải chúng là phí 4.2 GB dung lượng và thời gian.
               hf download RedHatAI/Qwen3.8-27B-speculator.dspark-preview \
                 --include "config.json" "config.py" "model.safetensors" \
-                --local-dir /models/RedHatAI/Qwen3.8-27B-speculator.dspark
+                --local-dir /models/Qwen3.8-27B-speculator.dspark
 
               echo "==> Download completed"
-              du -sh /models/Qwen/Qwen3.8-27B-FP8
-              du -sh /models/RedHatAI/Qwen3.8-27B-speculator.dspark
-              ls -la /models/RedHatAI/Qwen3.8-27B-speculator.dspark
+              du -sh /models/Qwen3.8-27B-FP8
+              du -sh /models/Qwen3.8-27B-speculator.dspark
+              ls -la /models/Qwen3.8-27B-speculator.dspark
           volumeMounts:
             - name: model-cache
               mountPath: /models

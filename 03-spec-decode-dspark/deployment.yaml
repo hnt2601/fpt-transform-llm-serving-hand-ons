@@ -27,7 +27,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
-            - /models/Qwen/Qwen3.8-27B-FP8
+            - /models/Qwen3.8-27B-FP8
             - --served-model-name=qwen3.8-27b
             - --host=0.0.0.0
             - --port=8000
@@ -64,7 +64,7 @@ spec:
             #   Drafter song song: đề xuất cả block 8 token trong MỘT
             #   lần chạy, thay vì 8 lượt tuần tự như EAGLE/MTP.
             #
-            # model=/models/RedHatAI/Qwen3.8-27B-speculator.dspark
+            # model=/models/Qwen3.8-27B-speculator.dspark
             #   BẮT BUỘC (khác MTP). Đã tải ở bài 00 — chỉ 3 file:
             #   config.json, config.py, model.safetensors (~4.0GB BF16).
             #   Backbone 5 lớp sliding_attention, đọc hidden state phụ
@@ -80,7 +80,7 @@ spec:
             # Đây là cấu hình CƠ SỞ, lấy đúng từ model card. Chạy và ghi
             # số với nó TRƯỚC.
             # ======================================================
-            - '--speculative-config={"method":"dspark","model":"/models/RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8}'
+            - '--speculative-config={"method":"dspark","model":"/models/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8}'
 
             # ------------------------------------------------------
             # TUỲ CHỌN — Adaptive verification (bài 03, Bước 1).
@@ -93,7 +93,7 @@ spec:
             # cơ sở chạy được TRƯỚC, rồi mới đổi sang dòng dưới đây.
             #
             # Comment dòng trên và bỏ comment dòng dưới:
-            # - '--speculative-config={"method":"dspark","model":"/models/RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8,"enable_adaptive_verification":true}'
+            # - '--speculative-config={"method":"dspark","model":"/models/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8,"enable_adaptive_verification":true}'
             # ------------------------------------------------------
           env:
             - name: HF_TOKEN

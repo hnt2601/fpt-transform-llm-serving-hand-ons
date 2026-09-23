@@ -115,7 +115,7 @@ Bài 00 đã tải sẵn về PVC. Xác nhận:
 
 ```bash
 kubectl exec -it deploy/bench-client -n token-factory -- \
-  ls -la /models/RedHatAI/Qwen3.8-27B-speculator.dspark
+  ls -la /models/Qwen3.8-27B-speculator.dspark
 ```
 
 Phải thấy đúng **3 file**:
@@ -164,7 +164,7 @@ Model card của checkpoint đưa ra lệnh tối giản sau — ta dùng đúng
 ```json
 {
   "method": "dspark",
-  "model": "/models/RedHatAI/Qwen3.8-27B-speculator.dspark",
+  "model": "/models/Qwen3.8-27B-speculator.dspark",
   "num_speculative_tokens": 8
 }
 ```
@@ -184,7 +184,7 @@ Model card không bật sẵn. Sau khi đã xác nhận cấu hình cơ sở ch�
 ```json
 {
   "method": "dspark",
-  "model": "/models/RedHatAI/Qwen3.8-27B-speculator.dspark",
+  "model": "/models/Qwen3.8-27B-speculator.dspark",
   "num_speculative_tokens": 8,
   "enable_adaptive_verification": true
 }
@@ -242,7 +242,7 @@ for C in 1 8 32 64; do
     --endpoint /v1/chat/completions \
     --base-url http://vllm-dspark:8000 \
     --model qwen3.8-27b \
-    --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+    --tokenizer /models/Qwen3.8-27B-FP8 \
     --dataset-name random \
     --random-prefix-len 2048 \
     --random-input-len 8000 \
@@ -297,7 +297,7 @@ vllm bench serve \
   --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-dspark:8000 \
   --model qwen3.8-27b \
-  --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+  --tokenizer /models/Qwen3.8-27B-FP8 \
   --dataset-name spec_bench \
   --num-prompts 200 \
   --max-concurrency 8 \
@@ -326,7 +326,7 @@ for IN in 8000 32000 100000; do
   vllm bench serve \
     --backend openai-chat --endpoint /v1/chat/completions \
     --base-url http://vllm-dspark:8000 --model qwen3.8-27b \
-    --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+    --tokenizer /models/Qwen3.8-27B-FP8 \
     --dataset-name random \
     --random-prefix-len 2048 \
     --random-input-len ${IN} \
@@ -372,7 +372,7 @@ Nếu acceptance length **giảm rõ rệt** ở 100k, nguyên nhân khả dĩ l
 | `unknown speculative method: dspark` | Image vLLM quá cũ | Cập nhật image. Model card đánh giá bằng vLLM `0.29.0` — hãy dùng bản này trở lên |
 | OOM khi khởi động | Speculator + target vượt ngân sách | Hạ `--gpu-memory-utilization` xuống 0.84, hoặc hạ `--max-model-len` |
 | `Unrecognized configuration class` / lỗi nạp config | Thiếu `--trust-remote-code` | `config.json` dùng `auto_map` trỏ tới `config.py`; cờ này là bắt buộc |
-| Không tìm thấy trọng số | Job bài 00 chỉ tải 3 file — kiểm tra `model.safetensors` có mặt | `ls -la /models/RedHatAI/Qwen3.8-27B-speculator.dspark` |
+| Không tìm thấy trọng số | Job bài 00 chỉ tải 3 file — kiểm tra `model.safetensors` có mặt | `ls -la /models/Qwen3.8-27B-speculator.dspark` |
 | Acceptance length < 2.0 | Speculator không khớp target | Checkpoint này chỉ dành cho **Qwen3.8-27B**. Ngoài ra nó được đánh giá với verifier **BF16**, ta đang dùng **FP8** — xem ghi chú ở Bước 2 |
 | Lỗi liên quan CUDA graph / attention backend | Adaptive verification yêu cầu `AttentionCGSupport.ALWAYS`; tài liệu vLLM nêu các backend sparse-MLA/sparse-SWA trên SM100 | Trên H100 (SM90): thử bỏ `enable_adaptive_verification`, xác nhận DSpark cơ bản chạy trước, rồi bật lại. Nếu vẫn lỗi, thêm `--enforce-eager` để chẩn đoán (chậm hơn nhưng loại trừ được nguyên nhân CUDA graph) |
 | Throughput thấp hơn baseline ở concurrency cao | Đúng như dự đoán khi adaptive verification chưa bật | Kiểm tra lại `enable_adaptive_verification: true` thực sự có hiệu lực trong log |

@@ -17,8 +17,8 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              TARGET=/models/Qwen/Qwen3.8-27B-FP8
-              DRAFT=/models/RedHatAI/Qwen3.8-27B-speculator.dspark
+              TARGET=/models/Qwen3.8-27B-FP8
+              DRAFT=/models/Qwen3.8-27B-speculator.dspark
               RC=0
 
               echo "===== Cây thư mục thực tế dưới /models (2 cấp) ====="

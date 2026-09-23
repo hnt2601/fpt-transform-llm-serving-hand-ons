@@ -23,7 +23,7 @@ Hai nhánh chỉ khác nhau ở **Bước 3 và Bước 4**. Bài 01–04 dùng 
 6. [Bước 4: Xác minh trọng số](#bước-4-xác-minh-trọng-số)
 7. [Bước 5: Deploy bench client](#bước-5-deploy-bench-client)
 8. [Bước 6: Kiểm tra GPU](#bước-6-kiểm-tra-gpu)
-9. [Điều chỉnh đường dẫn nếu layout khác](#điều-chỉnh-đường-dẫn-nếu-layout-khác)
+9. [Layout thư mục trọng số](#layout-thư-mục-trọng-số)
 
 ## 1. Điều kiện tiên quyết
 
@@ -194,9 +194,9 @@ Kết quả mong đợi:
 ===== Cây thư mục thực tế dưới /models (2 cấp) =====
 /models
 /models/Qwen
-/models/Qwen/Qwen3.8-27B-FP8
+/models/Qwen3.8-27B-FP8
 /models/RedHatAI
-/models/RedHatAI/Qwen3.8-27B-speculator.dspark
+/models/Qwen3.8-27B-speculator.dspark
 
 ===== [1/2] Target model =====
   OK  config.json
@@ -209,7 +209,7 @@ Kết quả mong đợi:
 DAT — trọng số đã sẵn sàng. Tiếp tục sang bài 01.
 ```
 
-Nếu job **FAIL**, log sẽ in ra cây thư mục thật và hướng dẫn xử lý. Xem tiếp [Điều chỉnh đường dẫn](#điều-chỉnh-đường-dẫn-nếu-layout-khác).
+Nếu job **FAIL**, log sẽ in ra cây thư mục thật và hướng dẫn xử lý. Xem tiếp [Layout thư mục trọng số](#layout-thư-mục-trọng-số).
 
 ```bash
 kubectl delete job verify-models -n token-factory
@@ -248,43 +248,59 @@ Ghi lại con số bộ nhớ. Toàn bộ tính toán ngân sách ở các bài 
 
 ---
 
-## Điều chỉnh đường dẫn nếu layout khác
+## Layout thư mục trọng số
 
-Các bài 01–04 mong đợi đúng hai đường dẫn sau **bên trong container**:
+Trên host workshop, trọng số nằm **phẳng** ngay dưới `/mnt/hps/fp8_models`, không có cấp thư mục tổ chức theo namespace HuggingFace:
 
 ```
-/models/Qwen/Qwen3.8-27B-FP8                      <- target model
-/models/RedHatAI/Qwen3.8-27B-speculator.dspark    <- DSpark speculator (bài 03, 04)
+/mnt/hps/fp8_models/                          <- mount vào /models trong container
+├── Qwen3.8-27B-FP8/                          <- target model  (bài 01, 02, 03, 04)
+│   ├── config.json
+│   └── model-0000x-of-0000y.safetensors
+└── Qwen3.8-27B-speculator.dspark/            <- DSpark speculator (bài 03, 04)
+    ├── config.json
+    ├── config.py
+    └── model.safetensors
 ```
 
-Nếu layout trên `/mnt/hps/fp8_models` khác đi (ví dụ trọng số nằm thẳng ở gốc, không có thư mục tổ chức `Qwen/`), bạn có hai lựa chọn:
+Vì vậy mọi manifest và lệnh benchmark dùng đúng hai đường dẫn:
 
-**Cách 1 — tạo symlink trên host** (khuyến nghị, sửa 1 lần):
+```
+/models/Qwen3.8-27B-FP8
+/models/Qwen3.8-27B-speculator.dspark
+```
+
+Nhánh tự học ở nhà tải về **đúng cấu trúc phẳng này**, nên hai nhánh dùng chung manifest không cần sửa gì.
+
+### Nếu layout trên máy bạn khác
+
+Job ở [Bước 4](#bước-4-xác-minh-trọng-số) sẽ in ra cây thư mục thật và báo lỗi. Có hai cách xử lý:
+
+**Cách 1 — tạo symlink trên host** (khuyến nghị: sửa một lần, không đụng vào manifest):
 
 ```bash
-# Trên node GPU, với layout thật là /mnt/hps/fp8_models/Qwen3.8-27B-FP8
-sudo mkdir -p /mnt/hps/fp8_models/Qwen /mnt/hps/fp8_models/RedHatAI
-sudo ln -s ../Qwen3.8-27B-FP8 /mnt/hps/fp8_models/Qwen/Qwen3.8-27B-FP8
-sudo ln -s ../Qwen3.8-27B-speculator.dspark \
-           /mnt/hps/fp8_models/RedHatAI/Qwen3.8-27B-speculator.dspark
+# Ví dụ: trọng số thật đang nằm ở /mnt/hps/fp8_models/qwen3.8-27b-fp8-v2/
+cd /mnt/hps/fp8_models
+sudo ln -s qwen3.8-27b-fp8-v2 Qwen3.8-27B-FP8
 ```
 
-**Cách 2 — sửa manifest.** Có đúng những chỗ sau:
+**Cách 2 — sửa manifest.** Các chỗ cần đổi:
 
 | File | Số chỗ | Nội dung |
 |---|---|---|
 | `01-baseline-agg/deployment.yaml` | 1 | arg đầu tiên của `vllm serve` |
 | `02-spec-decode-mtp/deployment.yaml` | 1 | arg đầu tiên |
-| `03-spec-decode-dspark/deployment.yaml` | 3 | arg đầu tiên + `model` trong `--speculative-config` (2 dòng: bản dùng và bản comment) |
-| `04-pd-disagg-dspark/deployment.yaml` | 3 | arg đầu tiên của prefill và decode + `model` trong `--speculative-config` |
+| `03-spec-decode-dspark/deployment.yaml` | 3 | arg đầu tiên + `model` trong `--speculative-config` (dòng đang dùng và dòng comment) |
+| `04-pd-disagg-dspark/deployment.yaml` | 3 | arg đầu tiên của prefill và của decode + `model` trong `--speculative-config` |
 | `00-prerequisites/04-bench-client.yaml` | 1 | biến `MODEL_PATH` |
+| `00-prerequisites/06-verify-models-job.yaml` | 2 | biến `TARGET` và `DRAFT` |
 
-Và trong các README, mọi cờ `--tokenizer /models/Qwen/Qwen3.8-27B-FP8` của lệnh benchmark.
+Và trong các README, mọi cờ `--tokenizer /models/Qwen3.8-27B-FP8` của lệnh benchmark.
 
-Kiểm tra nhanh còn sót chỗ nào:
+Kiểm tra còn sót chỗ nào:
 
 ```bash
-grep -rn "/models/Qwen\|/models/RedHatAI" . --include="*.yaml"
+grep -rn "/models/Qwen3.8" . --include="*.yaml" --include="*.md"
 ```
 
 ---

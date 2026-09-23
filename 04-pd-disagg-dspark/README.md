@@ -12,7 +12,7 @@ Bài này tách hẳn hai giai đoạn thành **hai engine trên hai GPU riêng*
 
 1. [Kiến trúc PD disaggregation](#1-kiến-trúc-pd-disaggregation)
 2. [Vì sao PD cần 2 GPU](#2-vì-sao-pd-cần-2-gpu)
-3. [Bước 1: Xác nhận 2 GPU](#bước-1-xác-nhận-2-gpu)
+3. [Bước 1: Xác nhận 2 GPU và kiểm tra NVLink](#bước-1-xác-nhận-2-gpu-và-kiểm-tra-nvlink)
 4. [Bước 2: Deploy prefill + decode + router](#bước-2-deploy-prefill--decode--router)
 5. [Bước 3: Kiểm tra KV transfer](#bước-3-kiểm-tra-kv-transfer)
 6. [Bước 4: Benchmark](#bước-4-benchmark)
@@ -125,7 +125,9 @@ Bước 5 sẽ đo riêng cột thứ ba.
 >
 > Đây chính là quyết định thật mà đội vận hành phải đưa ra khi có GPU thứ hai, và nó **không cần tới tensor parallel**: chỉ cần `kubectl scale deploy/vllm-dspark --replicas=2` ở bài 03. Phép so này sạch hơn nhiều so với việc đổi sang TP2, vì TP2 thay đổi cả cách model chạy bên trong một engine.
 
-## Bước 1: Xác nhận 2 GPU
+## Bước 1: Xác nhận 2 GPU và kiểm tra NVLink
+
+### 1.1 Đếm GPU
 
 ```bash
 kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
@@ -140,19 +142,91 @@ h100-node-01    2
 
 Nếu hai GPU nằm trên **hai node khác nhau**, mọi thứ vẫn chạy nhưng có hai điều phải xử lý:
 
-1. PVC `model-cache` phải là `ReadWriteMany` (NFS) để cả hai node đọc được trọng số. Xem lại `00-prerequisites/02-model-pvc.yaml`.
-2. KV cache đi qua mạng thay vì NVLink. NIXL hỗ trợ RDMA/UCX, nhưng **băng thông mạng trở thành nút thắt mới** — với InfiniBand thì ổn, với Ethernet 25GbE thì việc truyền KV sẽ chậm hơn cả việc tính lại prefill. Kiểm tra bằng cách so TTFT của bài này với bài 01.
+1. PVC `model-cache` phải đọc được từ cả hai node (`ReadWriteMany` với NFS, hoặc stage trọng số lên cả hai node nếu dùng hostPath).
+2. KV cache đi qua mạng thay vì NVLink/PCIe nội bộ. NIXL hỗ trợ RDMA/UCX, nhưng **băng thông mạng trở thành nút thắt mới**.
 
-Cấu hình trong `deployment.yaml` mặc định dùng `podAntiAffinity` mềm để **ưu tiên** hai engine nằm trên cùng node (tận dụng NVLink), nhưng không bắt buộc.
+Manifest dùng `podAffinity` mềm để **ưu tiên** hai engine nằm cùng node, nhưng không bắt buộc.
 
-Kiểm tra NVLink giữa hai GPU nếu cùng node:
+### 1.2 Kiểm tra NVLink và đo băng thông P2P
+
+Đây là bước riêng của bài 04, và nó không chỉ để "biết cho vui".
+
+**Vì sao nó quyết định kết quả bài này:** PD disaggregation đẩy **toàn bộ KV cache của mỗi request** từ GPU prefill sang GPU decode. Thời gian truyền đó **cộng thẳng vào TTFT**. Ba bài trước không có chi phí này — KV sinh ra ở đâu thì nằm luôn ở đó.
 
 ```bash
-kubectl apply -f 00-gpu-topology-job.yaml
-kubectl logs -f job/gpu-topology -n token-factory
+kubectl apply -f 00-nvlink-check-job.yaml
+kubectl logs -f job/nvlink-check -n token-factory
 ```
 
-Tìm `NV#` trong ma trận (ví dụ `NV18`) giữa GPU0 và GPU1 — nghĩa là có NVLink. Nếu chỉ thấy `PHB`/`SYS`, KV transfer sẽ đi qua PCIe, chậm hơn nhưng vẫn dùng được.
+Job chạy 4 bước: liệt kê GPU (kèm thế hệ PCIe), in ma trận topology, đọc trạng thái NVLink, và **đo băng thông GPU0 → GPU1 thật bằng PyTorch**.
+
+#### Đọc ma trận topology
+
+```
+        GPU0    GPU1    CPU Affinity
+GPU0     X      NV18    0-51
+GPU1    NV18     X      0-51
+```
+
+Ô giao giữa GPU0 và GPU1 cho biết đường đi:
+
+| Ký hiệu | Nghĩa | Đánh giá cho PD |
+|---|---|---|
+| `NV#` | NVLink, `#` là số link | **Tốt nhất.** H100 SXM thường thấy `NV18` |
+| `PIX` | Cùng một PCIe switch | Chấp nhận được |
+| `PXB` | Qua nhiều PCIe switch | Chấp nhận được |
+| `PHB` | Qua PCIe host bridge | Chậm hơn đáng kể |
+| `SYS` | Qua QPI/UPI giữa hai CPU socket | **Tệ nhất** — cân nhắc đổi cặp GPU khác |
+
+H100 có hai dạng: bản **SXM** có NVLink, bản **PCIe** thì không (trừ khi lắp NVLink Bridge). Nếu job báo "Không phát hiện NVLink", rất có thể bạn đang dùng H100 PCIe — điều đó hoàn toàn bình thường, chỉ là hệ quả cần biết trước khi đọc số liệu.
+
+#### Đọc kết quả đo băng thông
+
+```
+GPU0 truy cập trực tiếp GPU1 (P2P): True
+Băng thông GPU0 -> GPU1: 41x.x GB/s
+```
+
+| Băng thông đo được | Nhiều khả năng là | Ý nghĩa |
+|---|---|---|
+| 300–450 GB/s | NVLink 4 | Chi phí truyền KV gần như bỏ qua được |
+| 40–55 GB/s | PCIe Gen5 x16 | Có chi phí nhưng chấp nhận được |
+| 20–25 GB/s | PCIe Gen4 x16 | Chi phí đáng kể ở prompt dài |
+| < 15 GB/s | Không có P2P, đi vòng qua RAM host | Nút thắt nghiêm trọng |
+
+> Nếu dòng `P2P: False`, dữ liệu phải đi **vòng qua RAM của host** (GPU0 → CPU → GPU1) thay vì đi thẳng. Nguyên nhân thường gặp: hai GPU khác PCIe root complex, hoặc IOMMU/ACS đang bật chặn P2P. Với PD đây là vấn đề thật, không phải chi tiết nhỏ.
+
+#### Phần quan trọng nhất: quy ra chi phí thật
+
+Job tự tính sẵn bảng này cho bạn, dựa trên băng thông vừa đo:
+
+```
+--- Quy ra chi phí truyền KV (Qwen3.8-27B, kv-cache fp8) ---
+    prompt |   KV size |  thời gian truyền
+--------------------------------------------
+     8,000 |   0.24 GB |            0.6 ms
+    32,000 |   0.98 GB |            2.3 ms
+   131,072 |   4.00 GB |            9.6 ms
+```
+
+Phép tính dựa trên ~32 KB KV mỗi token (16/64 lớp có attention KV, 4 KV head, head_dim 256, fp8 — xem [bài 01 mục 2](../01-baseline-agg/#2-ngân-sách-bộ-nhớ-trên-h100-80gb)).
+
+**So dòng cuối với TTFT bạn đã đo ở bài 01** cho cùng độ dài prompt. Đó chính là thuế mà kiến trúc PD bắt bạn trả:
+
+| Đường truyền | Truyền KV của prompt 128k | So với TTFT prefill 128k (~2–4 s) |
+|---|---|---|
+| NVLink 4 (~400 GB/s) | ~10 ms | < 0.5% — không đáng kể |
+| PCIe Gen5 (~50 GB/s) | ~80 ms | ~2–4% — chấp nhận được |
+| PCIe Gen4 (~22 GB/s) | ~180 ms | ~5–9% — bắt đầu thấy |
+| Không P2P (~10 GB/s) | ~400 ms | > 10% — bào mòn nghiêm trọng lợi ích PD |
+
+> **Ghi lại con số này trước khi benchmark.** Ở Bước 6 bạn sẽ so TTFT của bài 04 với bài 01; phần chênh lệch **phải xấp xỉ** con số truyền KV ở đây. Nếu chênh lệch thực tế lớn hơn nhiều, nguyên nhân nằm ở chỗ khác (KV không được truyền và decode đang tự prefill lại — xem Bước 3), không phải ở băng thông.
+
+Dọn job:
+
+```bash
+kubectl delete job nvlink-check -n token-factory
+```
 
 ## Bước 2: Deploy prefill + decode + router
 
@@ -328,7 +402,7 @@ for C in 1 8 32 64; do
     --endpoint /v1/chat/completions \
     --base-url http://vllm-router:30000 \
     --model qwen3.8-27b \
-    --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+    --tokenizer /models/Qwen3.8-27B-FP8 \
     --dataset-name random \
     --random-prefix-len 2048 \
     --random-input-len 8000 \
@@ -355,7 +429,7 @@ for C in 128 192; do
   vllm bench serve \
     --backend openai-chat --endpoint /v1/chat/completions \
     --base-url http://vllm-router:30000 --model qwen3.8-27b \
-    --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+    --tokenizer /models/Qwen3.8-27B-FP8 \
     --dataset-name random \
     --random-prefix-len 2048 --random-input-len 8000 \
     --random-output-len 1000 --random-range-ratio 0.2 \
@@ -389,7 +463,7 @@ Terminal 1 — tải prefill nặng:
 ```bash
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-router:30000 --model qwen3.8-27b \
-  --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+  --tokenizer /models/Qwen3.8-27B-FP8 \
   --dataset-name random --random-input-len 30000 --random-output-len 50 \
   --num-prompts 64 --max-concurrency 16 --request-rate inf --ignore-eos
 ```
@@ -399,7 +473,7 @@ Terminal 2 — đồng thời đo trải nghiệm single-user:
 ```bash
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-router:30000 --model qwen3.8-27b \
-  --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+  --tokenizer /models/Qwen3.8-27B-FP8 \
   --dataset-name random --random-input-len 1000 --random-output-len 500 \
   --num-prompts 20 --max-concurrency 1 --request-rate inf --ignore-eos \
   --percentile-metrics ttft,tpot,itl --metric-percentiles 50,99
@@ -461,7 +535,14 @@ Khi đã có nhiều replica, `--policy` trở nên đáng quan tâm: `round_rob
 
 1. **Ở concurrency nào PD bắt đầu thắng rõ rệt?** Ở tải thấp, chi phí truyền KV qua NIXL chiếm tỉ trọng lớn trong TTFT nên PD có thể thua. Tìm điểm giao.
 
-2. **Chi phí truyền KV là bao nhiêu?** So TTFT p50 ở concurrency 1 của bài 04 với bài 01. Phần chênh chính là thời gian đẩy KV cache từ GPU 0 sang GPU 1. Nếu có NVLink, con số này nên rất nhỏ; nếu đi qua mạng Ethernet, nó có thể lớn tới mức xoá sạch lợi ích.
+2. **Chi phí truyền KV có khớp dự đoán không?** So TTFT p50 ở concurrency 1 của bài 04 với bài 01. Phần chênh chính là thời gian đẩy KV cache từ GPU 0 sang GPU 1 — và bạn đã có **con số dự đoán** từ bảng ở [Bước 1.2](#phần-quan-trọng-nhất-quy-ra-chi-phí-thật).
+
+   | | Giá trị |
+   |---|---|
+   | Dự đoán (job `nvlink-check`, prompt 10k) | ___ ms |
+   | Thực đo (TTFT bài 04 − TTFT bài 01) | ___ ms |
+
+   Nếu thực đo **xấp xỉ** dự đoán: kiến trúc đang chạy đúng như thiết kế. Nếu thực đo **lớn hơn nhiều lần**: KV nhiều khả năng không được truyền và decode đang tự prefill lại — quay lại Bước 3 kiểm tra.
 
 3. **PD có cộng hưởng với DSpark không?** So acceptance length của bài 03 và bài 04:
 
@@ -484,7 +565,7 @@ Kỳ vọng bài 04 cao hơn hoặc ổn định hơn, vì: (a) decode instance 
 | Router trả lời nhưng TTFT không cải thiện | Thiếu `--vllm-pd-disaggregation` | Không có cờ này, router chạy như load balancer thường và PD vô hiệu. Kiểm tra log router |
 | `vllm-router: command not found` | Image chưa bake sẵn package | Manifest tự `pip install vllm-router`. Nếu node không có internet, hãy yêu cầu image đã cài sẵn |
 | Request trả về nhưng rất chậm | KV không được truyền, decode tự prefill lại | Xem log decode có prompt token lớn không. Giữ `kv_load_failure_policy: fail` để lỗi nổi lên rõ ràng |
-| TTFT tệ hơn hẳn bài 01 | KV transfer đi qua PCIe/Ethernet thay vì NVLink | Chạy `00-gpu-topology-job.yaml`. Nếu là `SYS`/`PHB`, cân nhắc đặt hai engine trên hai GPU có NVLink |
+| TTFT tệ hơn hẳn bài 01 | KV transfer đi qua PCIe/Ethernet thay vì NVLink | Chạy `00-nvlink-check-job.yaml` (Bước 1.2). So phần chênh TTFT với bảng chi phí truyền KV mà job in ra |
 | Router báo `connection refused` | Một trong hai engine chưa ready | Router phải khởi động **sau** cả hai; manifest đã có initContainer chờ sẵn |
 | Throughput/GPU thấp hơn bài 03 | Có thể đúng với workload của bạn | Không phải lỗi. Xem [phần 2](#so-sánh-công-bằng-bài-04-dùng-2-gpu-bài-01-03-dùng-1-gpu) — hãy so cả TPOT p99 trước khi kết luận |
 
@@ -494,8 +575,8 @@ Kỳ vọng bài 04 cao hơn hoặc ổn định hơn, vì: (a) decode instance 
 kubectl delete -f deployment.yaml
 kubectl wait --for=delete pod -l lab=04-pd-dspark -n token-factory --timeout=300s
 
-# Job kiểm tra topology (nếu đã chạy)
-kubectl delete job gpu-topology -n token-factory --ignore-not-found
+# Job kiểm tra NVLink (nếu chưa xoá)
+kubectl delete job nvlink-check -n token-factory --ignore-not-found
 ```
 
 ---

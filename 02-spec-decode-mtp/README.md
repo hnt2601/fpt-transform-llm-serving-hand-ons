@@ -157,7 +157,7 @@ for C in 1 8 32 64; do
     --endpoint /v1/chat/completions \
     --base-url http://vllm-mtp:8000 \
     --model qwen3.8-27b \
-    --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+    --tokenizer /models/Qwen3.8-27B-FP8 \
     --dataset-name random \
     --random-prefix-len 2048 \
     --random-input-len 8000 \
