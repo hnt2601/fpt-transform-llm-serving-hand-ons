@@ -579,6 +579,62 @@ done
 
 </details>
 
+### Vì sao PD chậm hơn agg — cơ chế, đo bằng bằng chứng
+
+Cùng một khối lượng công việc (2.201.395 token vào, 256.000 token ra, @c32):
+
+| | Thời lượng |
+|---|---:|
+| MTP agg | **258.6 s** |
+| baseline agg | 289.2 s |
+| PD+MTP | 507.3 s |
+| PD+DSpark | **537.7 s** |
+
+PD mất **gần gấp đôi**. Ba bằng chứng giải thích vì sao:
+
+**Bằng chứng 1 — cả hai GPU đều nhàn rỗi.** Lấy mẫu `nvidia-smi` trong lúc chạy:
+
+```
+prefill util%:  11 13 13 26 13 100 12 13 15 13
+decode  util%:   9  9  9  9  9   9  9  9  8 100
+```
+
+Phần lớn thời gian **~10%**, thỉnh thoảng nhảy 100%. Không GPU nào là nút thắt — **sự phối hợp giữa chúng mới là**.
+
+**Bằng chứng 2 — decode đói request theo đợt.** Log engine decode:
+
+```
+Running:  1,  Waiting: 63,  Deferred: 44    gen   51.7 tok/s   <- gan nhu dung im
+Running: 39,  Waiting: 25,  Deferred:  6    gen   52.0 tok/s
+Running: 32,  Waiting: 32                   gen  559.1 tok/s
+Running: 45,  Waiting: 19                   gen 1542.1 tok/s   <- roi bung len
+```
+
+Throughput dao động **52 → 1542 tok/s**, gấp 30 lần. Trạng thái `Deferred` là mấu chốt: request đã prefill xong nhưng KV chưa tới nơi, decode không dùng được. **Hiệu ứng đoàn xe** — chờ một loạt, nhận một loạt, lại chờ.
+
+**Bằng chứng 3 — phép tính khớp.** Prefill 2.2M token ở ~14.000 tok/s ≈ 157 s. Decode ≈ 258 s. Tuần tự = 415 s, cộng overhead ≈ **507 s đo được**.
+
+> **Cơ chế gốc: agg CHỒNG LẤN hai pha, PD TUẦN TỰ HOÁ chúng.**
+>
+> vLLM ở agg mode dùng **chunked prefill** — nó nhét mẩu prefill của request B vào **cùng một batch forward** với bước decode của request A. Mỗi lần chạy GPU đều làm việc có ích cho cả hai pha, không có khoảng trống.
+>
+> PD phá bỏ khả năng đó. Prefill phải xong → truyền KV → decode mới bắt đầu. Về lý thuyết các request khác nhau vẫn pipeline được, nhưng thực tế bàn giao tạo ra bubble.
+
+### Và speculative decoding làm PD TỆ HƠN, không phải tốt hơn
+
+Đây là phần phản trực giác nhất của cả chuỗi bài:
+
+| @c32 | TPOT p50 (decode nhanh cỡ nào) | Output throughput |
+|---|---:|---:|
+| PD+DSpark | **10.66 ms** (nhanh hơn 36%) | 476.1 |
+| PD+MTP | 14.53 ms | **504.7** |
+
+**Decode nhanh hơn lại cho throughput thấp hơn.**
+
+Lý do: decode càng nhanh thì slot càng mau trống, mà mỗi slot trống cần một vòng **router → prefill → NIXL transfer** để lấp đầy. Speculative decoding làm **tăng tần suất đói request**, tức khuếch đại chính cái bubble ở trên.
+
+Ở agg mode thì ngược lại — slot trống được lấp ngay trong cùng batch bằng chunked prefill, không tốn round-trip nào. Đó là lý do speculative decoding và agg mode hợp nhau, còn speculative decoding và PD thì xung đột.
+
 ### PD làm đúng chính xác việc nó hứa — và chỉ việc đó
 
 | Giải quyết được | Không giải quyết được |
