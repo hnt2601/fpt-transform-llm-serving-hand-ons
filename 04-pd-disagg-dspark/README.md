@@ -538,6 +538,59 @@ done
 
 **Cột cuối là cột quan trọng.** Nếu `out tok/s per GPU` của bài 04 thấp hơn bài 03, nghĩa là với workload này, hai engine agg độc lập sau một load balancer sẽ hiệu quả hơn PD — một kết luận hoàn toàn hợp lệ và rất đáng ghi nhận. Nếu nó cao hơn hoặc ngang bằng **trong khi TPOT p99 ổn định hơn nhiều**, PD là lựa chọn đúng.
 
+<details>
+<summary><b>Số đo tham chiếu</b> — 2× H100 80GB, TP1, SPEED-Bench <code>throughput_8k</code>, seed 42</summary>
+
+**TPOT p50 (ms)** — PD thắng cả 4 mức, và gần như hằng số theo tải
+
+| Conc | baseline (1 GPU) | MTP (1 GPU) | DSpark (1 GPU) | **PD+DSpark (2 GPU)** |
+|---:|---:|---:|---:|---:|
+| 1 | 12.44 | 7.14 | 6.63 | **6.45** |
+| 8 | 16.56 | 12.19 | 13.13 | **9.38** |
+| 32 | 36.72 | 30.15 | 21.19 | **10.66** |
+| 64 | 62.54 | 46.97 | 21.35 | **10.64** |
+
+**ITL p99 (ms)** — độ mượt khi gõ, PD thắng áp đảo ở tải cao
+
+| Conc | baseline | MTP | DSpark | **PD+DSpark** |
+|---:|---:|---:|---:|---:|
+| 1 | **14.2** | 17.7 | 20.6 | 20.7 |
+| 8 | **18.5** | 268.5 | 280.5 | 30.1 |
+| 32 | 438.0 | 454.9 | 305.7 | **41.2** |
+| 64 | 474.7 | 475.6 | 305.8 | **41.0** |
+
+**Output throughput (tok/s)** — PD thua toàn diện
+
+| Conc | baseline | MTP | DSpark | PD+DSpark |
+|---:|---:|---:|---:|---:|
+| 1 | 76.7 | 131.0 | **143.4** | 116.0 |
+| 8 | 422.5 | **593.9** | 563.4 | 335.6 |
+| 32 | 885.1 | **990.1** | 669.9 | 476.1 |
+| 64 | **984.6** | 883.1 | 672.6 | 480.1 |
+
+**TTFT p50 (ms)**
+
+| Conc | baseline | MTP | DSpark | PD+DSpark |
+|---:|---:|---:|---:|---:|
+| 1 | 599 | 585 | **580** | 2.256 |
+| 8 | 2.506 | **624** | 648 | 14.704 |
+| 32 | 2.635 | **1.044** | 25.455 | 54.722 |
+| 64 | **2.266** | 21.135 | 73.060 | 119.812 |
+
+</details>
+
+### PD làm đúng chính xác việc nó hứa — và chỉ việc đó
+
+| Giải quyết được | Không giải quyết được |
+|---|---|
+| **Decode interference**: ITL p99 từ 475 ms xuống **41 ms** (11.6×), và **không đổi theo tải** | **Nút thắt KV cache**: tổng 2 GPU = 1.205.985 token, bằng đúng baseline 1 GPU |
+| **TPOT ổn định**: 6.45 → 10.64 ms từ c1 tới c64, trong khi baseline tăng gấp 5 | **Hàng đợi prefill**: TTFT p50 ở c64 là **119 giây** |
+| | **Lãng phí GPU prefill**: ở c8 prefill chạy 0 request trong khi decode cày 8 |
+
+Ba vấn đề chưa giải quyết đều quy về **một gốc duy nhất**: NIXL bắt prefill mang theo speculator 4 GB nó không bao giờ dùng, nên GPU thứ hai không mua thêm được dung lượng KV nào.
+
+> **Đó chính là điều [bài 05](../05-pd-disagg-mtp/) nhắm tới.** MTP speculator chỉ 477 MB thay vì 4 GB. Nếu ngân sách KV không bị bóp, PD+MTP có thể giữ ITL p99 ~41 ms và TPOT ~10 ms mà throughput không sụp.
+
 ## Bước 5: Đo lại phép thử interference của bài 01
 
 Đây là **phép đo quan trọng nhất của bài này**, và là phép đo duy nhất không bị nhiễu bởi việc bài 04 dùng gấp đôi GPU. Lặp lại đúng thí nghiệm ở Bài 01 Bước 5.
