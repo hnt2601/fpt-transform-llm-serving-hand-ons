@@ -60,7 +60,10 @@ spec:
             # ---- Scheduling: chunked prefill + prefix caching ----
             - --enable-prefix-caching
             - --max-num-batched-tokens=8192
-            - --max-num-seqs=64
+            # 128 (khong phai 64): dat BANG --max-num-seqs cua decode trong
+            # bai 04/05 de so sanh agg vs PD cong bang. Bat doi xung cau hinh
+            # la mot nguon sai lech de bi bo qua.
+            - --max-num-seqs=128
 
             # ---- Agentic coding: reasoning + tool calling ----
             - --reasoning-parser=qwen3

@@ -277,6 +277,54 @@ PD chỉ đáng khi SLA ràng buộc **độ mượt từng token** (ITL p99) v�
 | Throughput < MTP agg nhưng ITL p99 tốt hơn nhiều | Đánh đổi. Chọn theo SLA: ràng buộc độ mượt thì PD, ràng buộc công suất thì MTP agg |
 | Throughput < MTP agg **và** ITL p99 không hơn | **PD không đáng** với workload này. Dùng MTP agg, thêm GPU chạy replica thứ hai |
 
+## Bước 5: Tỉ lệ P:D — gỡ nút thắt nguồn cung
+
+Sweep ở Bước 3 chạy tỉ lệ **1 prefill : 1 decode**. Số liệu cho thấy đó là tỉ lệ sai ở tải cao, và phép tính rất đơn giản:
+
+```
+Prefill sinh ra : 14.000 tok/s ÷ 8.000 token/prompt = 1.75 req/s
+```
+
+| Concurrency | Decode cần | Trạng thái |
+|---:|---:|---|
+| 8 | 0.93 req/s | prefill **dư** → GPU prefill nhàn rỗi |
+| 32 | 2.20 req/s | prefill **thiếu** → decode đói |
+| 64 | 2.54 req/s | prefill **thiếu** → decode đói |
+
+Điểm giao nằm quanh **c16**.
+
+### Vì sao tăng batch decode KHÔNG giải quyết
+
+Đây là phản xạ đầu tiên của hầu hết mọi người, và nó sai. Decode đã đặt `--max-num-seqs=128` — thừa sức cho c32. Log cho thấy vấn đề thật:
+
+```
+Running: 0,  Waiting: 60,  Deferred: 45
+```
+
+Decode có 60 request chờ nhưng **0 đang chạy**, vì 45 request ở trạng thái `Deferred` — KV chưa truyền tới. Đây không phải giới hạn **sức chứa** mà là thiếu **nguồn cung**. Nâng `max-num-seqs` lên 256 cũng không sinh thêm được request nào.
+
+### Cách sửa đúng: thêm replica prefill
+
+```bash
+# Trong deployment.yaml, Deployment vllm-p-mtp:
+#   replicas: 2
+kubectl apply -f deployment.yaml
+```
+
+Service `vllm-p-mtp` tự phân tải giữa hai pod, router không cần đổi cấu hình. Mỗi prefill pod có pod IP riêng nên NIXL side channel không xung đột dù dùng chung port 5557.
+
+Hai prefill cho **3.5 req/s**, phủ được nhu cầu ở c32 (2.20) và c64 (2.54).
+
+Chạy lại sweep và điền:
+
+| @c32 | P:D = 1:1 | P:D = 2:1 |
+|---|---|---|
+| Output tok/s | 504.7 | |
+| TTFT p50 | 54.004 ms | |
+| ITL p99 | 39.3 ms | |
+
+> **Đây là gánh nặng vận hành thật của PD.** Tỉ lệ tối ưu phụ thuộc mức tải, mà tải thì thay đổi theo giờ. Agg mode không có bài toán này — chunked prefill để hai pha dùng chung một scheduler, tự cân bằng theo từng batch.
+
 ## Dọn dẹp
 
 ```bash

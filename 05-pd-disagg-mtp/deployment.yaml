@@ -37,7 +37,10 @@ metadata:
     lab: "05-pd-mtp"
     pd-role: prefill
 spec:
-  replicas: 1
+  # Ti le P:D = 2:1. Ly do do duoc o Buoc 4: prefill sinh ra 1.75 req/s
+  # (14.000 tok/s / 8.000 token moi prompt) trong khi decode can 2.20 req/s
+  # o c32. Mot prefill KHONG du de nuoi decode.
+  replicas: 2
   # Recreate (khong phai RollingUpdate mac dinh): xoa pod cu XONG moi tao
   # pod moi. Voi RollingUpdate, K8s khoi dong pod moi TRUOC khi xoa pod cu
   # (maxSurge=1), nen ca hai cung xin GPU -> tren node 1 GPU pod moi se
