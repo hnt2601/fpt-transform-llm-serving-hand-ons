@@ -230,6 +230,25 @@ PD+MTP **thắng PD+DSpark ở mọi chỉ số** — đúng như dự đoán t�
 >
 > Nút thắt thật là **cơ chế bàn giao**: agg chồng lấn prefill với decode trong cùng batch, PD tuần tự hoá chúng. Xem [phần phân tích cơ chế ở bài 04](../04-pd-disagg-dspark/#vì-sao-pd-chậm-hơn-agg--cơ-chế-đo-bằng-bằng-chứng).
 
+### Ở c64, PD+MTP SỤP còn PD+DSpark thì không
+
+Nhận định "PD+MTP tốt hơn PD+DSpark ở mọi mức" chỉ đúng tới c32. Ở c64 nó đảo ngược:
+
+| @c64 | PD+DSpark | PD+MTP | |
+|---|---:|---:|---|
+| ITL p99 | **41.0 ms** | 153.3 ms | tệ gấp **3.7×** |
+| TPOT p50 | **10.64 ms** | 25.16 ms | tệ gấp **2.4×** |
+| TTFT p50 | 119.8 s | **78.8 s** | PD+MTP tốt hơn |
+| Output tok/s | 480.1 | 475.6 | ngang nhau |
+
+DSpark **giữ nguyên** độ mượt từ c32 sang c64 (41.2 → 41.0 ms). MTP thì từ 39.3 nhảy lên 153.3 ms.
+
+> **Cách giải thích khớp với cơ chế bubble.** DSpark có acceptance length ~2.7 so với MTP ~2.18, nghĩa là mỗi bước decode sinh ra nhiều token hơn 24%. Ít bước decode hơn → **ít vòng bàn giao hơn** → ít bubble hơn.
+>
+> Ở c32 ngân sách KV còn thoải mái nên khác biệt này bị che. Ở c64, khi hàng đợi dài và bàn giao trở thành nút thắt thật, acceptance length cao hơn **mua được sự ổn định**.
+>
+> Đây là lần duy nhất trong cả chuỗi bài mà acceptance length cao hơn thực sự mang lại lợi ích đo được — và nó chỉ xảy ra trong kiến trúc PD, nơi mỗi bước decode tốn một round-trip.
+
 ### Với ràng buộc throughput, MTP agg vẫn thắng
 
 | @c32 | MTP agg | PD+MTP | |
