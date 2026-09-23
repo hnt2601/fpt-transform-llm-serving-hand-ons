@@ -317,6 +317,36 @@ Phần này bám theo mẫu triển khai PD chuẩn của vLLM. Nếu bạn quen
 | `VLLM_NIXL_SIDE_CHANNEL_PORT` | Kênh trao đổi metadata vùng nhớ. Hai instance **phải khác port** nếu cùng host — ở đây là 5557/5558 |
 | `GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME` | Chỉ định interface mạng cho collective communication. Đặt `eth0` đúng với hầu hết CNI; nếu cluster dùng tên khác, chạy `ip -o link` trong pod để xem |
 | `UCX_NET_DEVICES=all` | Cho UCX dùng mọi thiết bị khả dụng (NVLink, IB, TCP) |
+| **`VLLM_SSM_CONV_STATE_LAYOUT=DS`** | **Bắt buộc với Qwen3.8.** Xem mục ngay dưới |
+
+### Kiến trúc lai bắt PD phải truyền HAI loại state
+
+Đây là lỗi sẽ chặn bạn ngay lần deploy đầu tiên, và không có cách nào đoán trước:
+
+```
+AssertionError: 3-read Mamba conv transfer requires DS conv state layout.
+Set VLLM_SSM_CONV_STATE_LAYOUT=DS
+```
+
+Engine chết lúc khởi động, cả prefill lẫn decode, với `RuntimeError: Engine core initialization failed`.
+
+Nguyên nhân quay về đúng [kiến trúc lai đã phân tích ở bài 01](../01-baseline-agg/#vì-sao-128k-context-lại-khả-thi-trên-1-gpu):
+
+```
+Hidden Layout: 16 × ( 3 × (Gated DeltaNet → FFN) → 1 × (Gated Attention → FFN) )
+                     └── 48 lớp ──┘                └── 16 lớp ──┘
+                     CONV STATE                     KV CACHE
+```
+
+> **PD disaggregation với model lai phải truyền hai thứ, không phải một.**
+>
+> Với transformer thuần, prefill sinh ra **KV cache** và chỉ cần đẩy nó sang decode. Với Qwen3.8, 48/64 lớp là Gated DeltaNet — chúng không có KV cache mà có **conv state**. Muốn decode tiếp tục đúng chỗ prefill dừng, NIXL phải truyền **cả hai**.
+>
+> Và conv state phải nằm ở layout `DS` thì NIXL mới đọc được bằng cơ chế 3-read. Đó là ý nghĩa của biến môi trường này.
+
+Ở bài 01, kiến trúc lai là **món quà** — nó cho phép 128k context trên một GPU vì chỉ 16/64 lớp có KV cache phình theo độ dài. Ở bài 04, chính nó thành **gánh nặng** — có thêm một loại state phải đồng bộ qua mạng.
+
+**Phải đặt giống nhau ở cả hai engine.** Lệch nhau thì bên nhận không giải mã được state bên gửi.
 
 ### Router: `vllm-router`
 
