@@ -1,0 +1,47 @@
+# ==============================================================
+# LANE TỰ HỌC Ở NHÀ — chưa có trọng số, cần tải về.
+#
+# Dùng file này THAY CHO 02-storage-workshop.yaml, rồi chạy
+# 03-model-download-job.yaml để tải trọng số xuống PVC.
+#
+# Khác biệt duy nhất so với lane workshop: `model-cache` là PVC
+# dynamic GHI ĐƯỢC (để job tải về), thay vì hostPath read-only.
+# Các bài 01-04 KHÔNG cần sửa gì — vẫn mount cùng tên PVC vào /models.
+# ==============================================================
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache
+  namespace: token-factory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 120Gi        # Qwen3.8-27B-FP8 (~28GB) + speculator (~4GB) + dư
+  # storageClassName: <SỬA CHO KHỚP CLUSTER CỦA BẠN>   # xem: kubectl get sc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache
+  namespace: token-factory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bench-results
+  namespace: token-factory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

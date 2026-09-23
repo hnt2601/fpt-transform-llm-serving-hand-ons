@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: vllm/vllm-openai:latest      # production: pin tag cụ thể
+          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
@@ -63,8 +63,10 @@ spec:
             - name: VLLM_LOGGING_LEVEL
               value: "INFO"
             # Cache biên dịch torch.compile -> lần khởi động sau nhanh hơn nhiều
+            # Cache torch.compile GHI vào PVC riêng — thư mục trọng số
+            # được mount READ-ONLY (workshop dùng chung host path).
             - name: VLLM_CACHE_ROOT
-              value: /models/.vllm-cache
+              value: /cache
           ports:
             - name: http
               containerPort: 8000
@@ -80,6 +82,9 @@ spec:
           volumeMounts:
             - name: model-cache
               mountPath: /models
+              readOnly: true
+            - name: vllm-cache
+              mountPath: /cache
             - name: shm
               mountPath: /dev/shm
           # Model 27B mất vài phút để load + compile -> startupProbe nới rộng
@@ -104,6 +109,10 @@ spec:
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-cache
+            readOnly: true
+        - name: vllm-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache
         - name: shm
           emptyDir:
             medium: Memory

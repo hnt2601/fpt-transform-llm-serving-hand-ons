@@ -1,5 +1,13 @@
-# Tải trọng số model xuống PVC `model-cache`.
-# Chạy MỘT LẦN. Các bài 01-04 chỉ mount PVC này ở chế độ đọc.
+# ==============================================================
+# CHỈ DÙNG Ở NHÁNH "TỰ HỌC Ở NHÀ".
+#
+# Workshop: trọng số ĐÃ CÓ SẴN tại host /mnt/hps/fp8_models
+#           -> dùng 02-storage-workshop.yaml, BỎ QUA file này.
+#
+# Tự học:   dùng 02-storage-home.yaml trước, rồi chạy job này.
+#           Chạy MỘT LẦN; các bài 01-04 chỉ mount PVC ở chế độ đọc.
+#           Thời gian tải ~30-45 phút tuỳ băng thông.
+# ==============================================================
 apiVersion: batch/v1
 kind: Job
 metadata:

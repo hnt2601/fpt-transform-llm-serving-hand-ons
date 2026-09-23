@@ -51,6 +51,7 @@ Mỗi thư mục bài gồm:
 |---|---|---|
 | Model | `Qwen/Qwen3.8-27B-FP8` | FP8 → ~27.5 GB trọng số, vừa 1×H100 80GB và còn chỗ cho KV cache |
 | Speculator (bài 03, 04) | `RedHatAI/Qwen3.8-27B-speculator.dspark-preview` | Định dạng `speculators` native của vLLM, `block_size = 8` |
+| Engine | `vllm/vllm-openai:v0.29.0` | Pin cứng — cùng phiên bản thì benchmark mới so được |
 | `--max-model-len` | `131072` (128k) | Đủ cho phiên agentic coding dài; giữ cố định để KV budget so sánh được. Model hỗ trợ native 262k |
 | `--tensor-parallel-size` | `1` | Model FP8 chỉ 27.5 GB → vừa 1 GPU. TP2 chỉ thêm chi phí all-reduce mà không giải quyết vấn đề gì |
 | `--kv-cache-dtype` | `fp8` | Gấp đôi số token KV chứa được |
@@ -86,6 +87,19 @@ Sau mỗi bài, điền vào bảng trong [99-compare-results/](99-compare-resul
 
 ---
 
+## 4b. Môi trường workshop
+
+Workshop FPT Transform đã chuẩn bị sẵn để không ai phải ngồi chờ tải dữ liệu:
+
+| Đã chuẩn bị sẵn | Ở đâu | Hệ quả |
+|---|---|---|
+| Trọng số model | Host path **`/mnt/hps/fp8_models`** trên node GPU | Bỏ qua bước tải model ở bài 00 → tiết kiệm ~40 phút |
+| Image Docker | Đã `docker pull` sẵn trên node | Pod khởi động ngay; mọi manifest đặt `imagePullPolicy: IfNotPresent` |
+
+Bài 00 có **hai nhánh**: nhánh **Workshop** (bọc host path thành PVC) và nhánh **Tự học ở nhà** (tải từ HuggingFace). Job tải model vẫn được giữ nguyên trong repo để bạn dựng lại toàn bộ môi trường sau workshop.
+
+Bài 01–04 **không khác gì giữa hai nhánh** — cả hai đều tạo ra một PVC tên `model-cache` mount vào `/models`.
+
 ## 5. Yêu cầu trước khi bắt đầu
 
 - Kubernetes có GPU H100 80GB, đã cài NVIDIA GPU Operator (hoặc device plugin):
@@ -102,7 +116,9 @@ Bắt đầu tại **[00-prerequisites/](00-prerequisites/)**.
 
 ## 6. Ghi chú về phiên bản
 
-Các manifest dùng image `vllm/vllm-openai:latest`. Trong môi trường thật **hãy pin tag cụ thể** (ví dụ tag mà đội bạn đã kiểm thử) để kết quả benchmark tái lập được. DSpark và MTP là tính năng tương đối mới — nếu `--speculative-config` báo lỗi `unknown method`, image của bạn quá cũ. Model card của speculator đánh giá bằng **vLLM 0.29.0**; hãy dùng bản này trở lên.
+Mọi manifest pin cứng **`vllm/vllm-openai:v0.29.0`**. Đây cũng là bản mà model card của DSpark speculator dùng để đánh giá, nên các con số acceptance trong bài 03 so sánh được.
+
+Đừng đổi sang `:latest` khi đang làm bài: benchmark giữa 4 bài chỉ có ý nghĩa nếu chạy trên cùng một phiên bản engine. Nếu `--speculative-config` báo lỗi `unknown method`, bạn đang dùng image cũ hơn 0.29.0.
 
 Tài liệu gốc tham chiếu:
 - [vLLM — Speculative Decoding](https://docs.vllm.ai/en/latest/features/speculative_decoding/)

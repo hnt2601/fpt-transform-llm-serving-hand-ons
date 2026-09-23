@@ -1,9 +1,9 @@
 # Bài 04 — PD Disaggregation + DSpark trên 2× H100 80GB.
 #
-# 3 thành phần:
-#   vllm-prefill : kv_producer, KHÔNG speculative decoding   -> 1 GPU
-#   vllm-decode  : kv_consumer, CÓ DSpark speculative decoding -> 1 GPU
-#   pd-proxy     : điều phối request (prefill -> decode)      -> CPU only
+# Cấu trúc bám theo mẫu triển khai PD chuẩn của vLLM (xem README):
+#   vllm-prefill : kv_producer, port 8001, KHÔNG speculative decoding -> 1 GPU
+#   vllm-decode  : kv_consumer, port 8002, CÓ DSpark + FULL_DECODE_ONLY -> 1 GPU
+#   vllm-router  : vllm-router --vllm-pd-disaggregation, port 30000    -> CPU only
 #
 # ĐIỀU KIỆN TIÊN QUYẾT: cluster có 2 GPU rảnh (bài 03 đã xoá).
 #   kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
@@ -25,8 +25,7 @@
 # VÌ SAO KHÔNG LÀM TRÊN 1 GPU: trọng số 27.5GB bị nạp HAI LẦN -> chỉ còn
 # ~14.5GB KV chia đôi cho hai bên. Ở max-model-len 131072, mỗi bên chỉ đủ
 # cho 1-2 sequence dài. GPU sharing (time-slicing/MPS) cũng không tạo thêm
-# SM hay băng thông —
-# bạn trả toàn bộ chi phí của PD mà gần như không nhận được lợi ích.
+# SM hay băng thông — bạn trả toàn bộ chi phí của PD mà không nhận lợi ích.
 # ------------------------------------------------------------------
 ---
 apiVersion: apps/v1
@@ -52,23 +51,28 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: vllm/vllm-openai:latest
+          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
             - /models/Qwen/Qwen3.8-27B-FP8
             - --served-model-name=qwen3.8-27b
             - --host=0.0.0.0
-            - --port=8000
+            - --port=8001                  # PREFILL: 8001 (decode dùng 8002)
             - --trust-remote-code
 
-            # TP1: mỗi engine dùng ĐÚNG 1 GPU. Toàn chuỗi bài giữ TP1 để
-            # mọi so sánh đều trên cùng đơn vị phần cứng (1 engine = 1 GPU).
-            # PD ở đây là 2 GPU vì có 2 ENGINE, không phải vì tăng TP.
+            # TP1: một engine = một GPU. PD dùng 2 GPU vì có 2 ENGINE,
+            # không phải vì xẻ nhỏ model qua tensor parallel.
             - --tensor-parallel-size=1
+
             - --gpu-memory-utilization=0.88
             - --max-model-len=131072   # 128k - xem README về ngân sách KV
             - --kv-cache-dtype=fp8
+
+            # block-size 128 (mặc định 16): KV được truyền qua NIXL theo
+            # từng block. Block lớn -> ít lần truyền, mỗi lần nhiều dữ liệu
+            # -> hiệu quả hơn hẳn cho PD. PHẢI GIỐNG NHAU ở cả hai engine.
+            - --block-size=128
 
             # ---- Tối ưu RIÊNG cho prefill ----
             # Nhồi nhiều token mỗi batch; ít seq nhưng mỗi seq rất dài.
@@ -93,18 +97,33 @@ spec:
                 secretKeyRef:
                   name: hf-token
                   key: token
-            # Kênh bắt tay NIXL — PHẢI khác port của decode.
+
+            # ---- NIXL handshake ----
+            # HOST phải là địa chỉ mà bên decode GỌI TỚI ĐƯỢC. Trong K8s,
+            # lấy pod IP qua downward API thay vì hardcode hostname.
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: VLLM_NIXL_SIDE_CHANNEL_PORT
-              value: "5600"
+              value: "5557"          # decode dùng 5558 — PHẢI khác nhau
             - name: UCX_NET_DEVICES
               value: "all"
+            # Tên interface mạng cho GLOO/NCCL. "eth0" đúng với hầu hết CNI;
+            # nếu cluster dùng Calico/Cilium với tên khác, sửa lại cho khớp
+            # (chạy `ip -o link` trong pod để xem).
+            - name: GLOO_SOCKET_IFNAME
+              value: "eth0"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
+
             - name: VLLM_CACHE_ROOT
-              value: /models/.vllm-cache-prefill
+              value: /cache
           ports:
             - name: http
-              containerPort: 8000
+              containerPort: 8001
             - name: nixl
-              containerPort: 5600
+              containerPort: 5557
           resources:
             requests:
               cpu: "6"
@@ -117,19 +136,26 @@ spec:
           volumeMounts:
             - name: model-cache
               mountPath: /models
+              readOnly: true
+            - name: vllm-cache
+              mountPath: /cache
             - name: shm
               mountPath: /dev/shm
           startupProbe:
-            httpGet: { path: /health, port: 8000 }
+            httpGet: { path: /health, port: 8001 }
             failureThreshold: 120
             periodSeconds: 10
           readinessProbe:
-            httpGet: { path: /health, port: 8000 }
+            httpGet: { path: /health, port: 8001 }
             periodSeconds: 10
       volumes:
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-cache
+            readOnly: true
+        - name: vllm-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 ---
@@ -143,11 +169,11 @@ spec:
     app: vllm-prefill
   ports:
     - name: http
-      port: 8000
-      targetPort: 8000
+      port: 8001
+      targetPort: 8001
     - name: nixl
-      port: 5600
-      targetPort: 5600
+      port: 5557
+      targetPort: 5557
   type: ClusterIP
 ---
 apiVersion: apps/v1
@@ -188,23 +214,24 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: vllm
-          image: vllm/vllm-openai:latest
+          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
             - /models/Qwen/Qwen3.8-27B-FP8
             - --served-model-name=qwen3.8-27b
             - --host=0.0.0.0
-            - --port=8000
+            - --port=8002                  # DECODE: 8002 (prefill dùng 8001)
             - --trust-remote-code
 
-            # TP1: mỗi engine dùng ĐÚNG 1 GPU. Toàn chuỗi bài giữ TP1 để
-            # mọi so sánh đều trên cùng đơn vị phần cứng (1 engine = 1 GPU).
-            # PD ở đây là 2 GPU vì có 2 ENGINE, không phải vì tăng TP.
             - --tensor-parallel-size=1
+
             - --gpu-memory-utilization=0.88
             - --max-model-len=131072   # 128k - xem README về ngân sách KV
             - --kv-cache-dtype=fp8
+
+            # PHẢI GIỐNG prefill, nếu không NIXL không ghép được block.
+            - --block-size=128
 
             # ---- Tối ưu RIÊNG cho decode ----
             # Batch rộng (nhiều seq), mỗi bước chỉ vài token/seq.
@@ -213,6 +240,13 @@ spec:
             # cho prefill -> ôm được nhiều session đồng thời hơn.
             - --max-num-seqs=128
             - --enable-prefix-caching
+
+            # cudagraph_mode=FULL_DECODE_ONLY: engine này KHÔNG BAO GIỜ chạy
+            # prefill, nên chỉ cần capture CUDA graph cho đường decode.
+            # -> tiết kiệm thời gian khởi động và bộ nhớ graph, và giữ cho
+            #    graph của nhánh speculative không bị phá vỡ.
+            # Đây là tối ưu CHỈ CÓ THỂ làm khi đã tách PD.
+            - '--compilation-config={"cudagraph_mode":"FULL_DECODE_ONLY"}'
 
             - --reasoning-parser=qwen3
             - --tool-call-parser=qwen3_coder
@@ -227,7 +261,6 @@ spec:
             # token, speculative decoding ở đó chỉ làm chậm.
             # Đây là lợi ích mà agg mode không có được: bật spec decoding
             # cho ĐÚNG nửa cần nó.
-            # Xem bài 03 để biết chi tiết từng khoá và tuỳ chọn adaptive.
             - '--speculative-config={"method":"dspark","model":"/models/RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8}'
           env:
             - name: HF_TOKEN
@@ -235,18 +268,25 @@ spec:
                 secretKeyRef:
                   name: hf-token
                   key: token
-            # PHẢI khác port của prefill (5600).
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: VLLM_NIXL_SIDE_CHANNEL_PORT
-              value: "5601"
+              value: "5558"          # PHẢI khác prefill (5557)
             - name: UCX_NET_DEVICES
               value: "all"
+            - name: GLOO_SOCKET_IFNAME
+              value: "eth0"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
             - name: VLLM_CACHE_ROOT
-              value: /models/.vllm-cache-decode
+              value: /cache
           ports:
             - name: http
-              containerPort: 8000
+              containerPort: 8002
             - name: nixl
-              containerPort: 5601
+              containerPort: 5558
           resources:
             requests:
               cpu: "6"
@@ -259,19 +299,26 @@ spec:
           volumeMounts:
             - name: model-cache
               mountPath: /models
+              readOnly: true
+            - name: vllm-cache
+              mountPath: /cache
             - name: shm
               mountPath: /dev/shm
           startupProbe:
-            httpGet: { path: /health, port: 8000 }
+            httpGet: { path: /health, port: 8002 }
             failureThreshold: 150
             periodSeconds: 10
           readinessProbe:
-            httpGet: { path: /health, port: 8000 }
+            httpGet: { path: /health, port: 8002 }
             periodSeconds: 10
       volumes:
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-cache
+            readOnly: true
+        - name: vllm-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 ---
@@ -285,73 +332,73 @@ spec:
     app: vllm-decode
   ports:
     - name: http
-      port: 8000
-      targetPort: 8000
+      port: 8002
+      targetPort: 8002
     - name: nixl
-      port: 5601
-      targetPort: 5601
+      port: 5558
+      targetPort: 5558
   type: ClusterIP
 ---
-# Proxy điều phối: nhận request -> gửi prefill -> chuyển tiếp decode.
-# Dùng toy_proxy_server.py đi kèm repo vLLM (đủ cho mục đích học tập).
-# PRODUCTION: thay bằng router thật có KV-aware routing, ví dụ router của
-# vLLM Production Stack hoặc Gateway API Inference Extension.
+# vllm-router — router chính thức của vLLM cho PD disaggregation.
+# Thay cho toy proxy: nó hiểu giao thức PD (gửi prefill trước, rồi chuyển
+# tiếp sang decode), có chính sách định tuyến, và dùng được trong production.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pd-proxy
+  name: vllm-router
   namespace: token-factory
   labels:
-    app: pd-proxy
+    app: vllm-router
     lab: "04-pd-dspark"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: pd-proxy
+      app: vllm-router
   template:
     metadata:
       labels:
-        app: pd-proxy
+        app: vllm-router
         lab: "04-pd-dspark"
     spec:
       initContainers:
-        # Proxy phải khởi động SAU khi cả hai engine đã ready.
+        # Router phải khởi động SAU khi cả hai engine đã ready.
         - name: wait-for-engines
-          image: curlimages/curl:latest
+          image: curlimages/curl:8.11.1
+          imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
             - |
-              until curl -sf http://vllm-prefill:8000/health; do
+              until curl -sf http://vllm-prefill:8001/health; do
                 echo "waiting for prefill..."; sleep 10; done
-              until curl -sf http://vllm-decode:8000/health; do
+              until curl -sf http://vllm-decode:8002/health; do
                 echo "waiting for decode...";  sleep 10; done
               echo "both engines ready"
       containers:
-        - name: proxy
-          image: vllm/vllm-openai:latest
+        - name: router
+          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
+          imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -euo pipefail
-              PROXY=$(find / -name toy_proxy_server.py -path "*nixl_integration*" 2>/dev/null | head -1)
-              if [ -z "${PROXY}" ]; then
-                echo "Không tìm thấy toy_proxy_server.py trong image."
-                echo "Tải từ repo vLLM, nhánh khớp phiên bản image:"
-                echo "  tests/v1/kv_connector/nixl_integration/toy_proxy_server.py"
-                exit 1
+              # Workshop: nếu image đã bake sẵn vllm-router thì bỏ qua bước này.
+              if ! command -v vllm-router >/dev/null 2>&1; then
+                echo "==> cài vllm-router"
+                (command -v uv >/dev/null 2>&1 && uv pip install --system vllm-router) \
+                  || pip install --no-cache-dir vllm-router
               fi
-              echo "Using proxy at ${PROXY}"
-              exec python3 "${PROXY}" \
+              exec vllm-router \
+                --policy round_robin \
+                --vllm-pd-disaggregation \
+                --prefill http://vllm-prefill:8001 \
+                --decode  http://vllm-decode:8002 \
                 --host 0.0.0.0 \
-                --port 8192 \
-                --prefiller-hosts vllm-prefill \
-                --prefiller-ports 8000 \
-                --decoder-hosts vllm-decode \
-                --decoder-ports 8000
+                --port 30000 \
+                --intra-node-data-parallel-size 1
           ports:
             - name: http
-              containerPort: 8192
+              containerPort: 30000
           resources:
             requests:
               cpu: "2"
@@ -359,17 +406,21 @@ spec:
             limits:
               cpu: "4"
               memory: 8Gi
+          readinessProbe:
+            tcpSocket: { port: 30000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: pd-proxy
+  name: vllm-router
   namespace: token-factory
 spec:
   selector:
-    app: pd-proxy
+    app: vllm-router
   ports:
     - name: http
-      port: 8192
-      targetPort: 8192
+      port: 30000
+      targetPort: 30000
   type: ClusterIP

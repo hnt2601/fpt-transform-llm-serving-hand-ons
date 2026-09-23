@@ -1,0 +1,88 @@
+# ==============================================================
+# LANE WORKSHOP — trọng số model ĐÃ CÓ SẴN trên host.
+#
+# Ban tổ chức đã stage sẵn trọng số tại host path:
+#     /mnt/hps/fp8_models
+#
+# File này KHÔNG tải gì cả. Nó chỉ bọc thư mục host đó lại thành
+# một PVC tên `model-cache` để các bài 01-04 mount vào /models.
+#
+# Nếu bạn tự thực hành ở nhà (không có sẵn trọng số), dùng
+# 02-storage-home.yaml thay cho file này, rồi chạy
+# 03-model-download-job.yaml.
+# ==============================================================
+---
+# PV bọc thư mục host chứa trọng số. hostPath chỉ dùng được khi pod
+# chạy đúng trên node có thư mục đó -> nodeAffinity ghim lại.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: model-weights-pv
+  labels:
+    fpt.transform/role: model-weights
+spec:
+  capacity:
+    storage: 200Gi          # chỉ là nhãn; hostPath không thực sự giới hạn
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain   # KHÔNG BAO GIỜ xoá dữ liệu host
+  storageClassName: manual
+  hostPath:
+    path: /mnt/hps/fp8_models
+    type: Directory         # deploy sẽ FAIL NGAY nếu thư mục không tồn tại
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                # SỬA cho khớp tên node GPU của bạn:
+                #   kubectl get nodes
+                - h100-node-01
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache
+  namespace: token-factory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: manual        # khớp PV ở trên, không dùng dynamic provisioning
+  selector:
+    matchLabels:
+      fpt.transform/role: model-weights
+---
+# Cache biên dịch torch.compile. TÁCH RIÊNG khỏi model-cache vì thư mục
+# trọng số trên host là dùng chung và được mount READ-ONLY.
+# Giữ cache này giúp lần deploy thứ hai trở đi khởi động nhanh hơn nhiều.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache
+  namespace: token-factory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # storageClassName: <SỬA CHO KHỚP CLUSTER CỦA BẠN>   # xem: kubectl get sc
+---
+# Lưu kết quả benchmark JSON của cả 4 bài.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bench-results
+  namespace: token-factory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: <SỬA CHO KHỚP CLUSTER CỦA BẠN>

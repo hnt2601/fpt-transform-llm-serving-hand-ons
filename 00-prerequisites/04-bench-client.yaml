@@ -17,7 +17,8 @@ spec:
     spec:
       containers:
         - name: bench
-          image: vllm/vllm-openai:latest   # production: hãy pin tag cụ thể
+          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
+          imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "-c", "sleep infinity"]
           env:
             - name: HF_TOKEN

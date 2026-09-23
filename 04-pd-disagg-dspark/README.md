@@ -13,7 +13,7 @@ Bài này tách hẳn hai giai đoạn thành **hai engine trên hai GPU riêng*
 1. [Kiến trúc PD disaggregation](#1-kiến-trúc-pd-disaggregation)
 2. [Vì sao PD cần 2 GPU](#2-vì-sao-pd-cần-2-gpu)
 3. [Bước 1: Xác nhận 2 GPU](#bước-1-xác-nhận-2-gpu)
-4. [Bước 2: Deploy prefill + decode + proxy](#bước-2-deploy-prefill--decode--proxy)
+4. [Bước 2: Deploy prefill + decode + router](#bước-2-deploy-prefill--decode--router)
 5. [Bước 3: Kiểm tra KV transfer](#bước-3-kiểm-tra-kv-transfer)
 6. [Bước 4: Benchmark](#bước-4-benchmark)
 7. [Bước 5: Đo lại phép thử interference của bài 01](#bước-5-đo-lại-phép-thử-interference-của-bài-01)
@@ -25,13 +25,16 @@ Bài này tách hẳn hai giai đoạn thành **hai engine trên hai GPU riêng*
 
 ```
                     ┌────────────────────┐
-   request ───────▶ │   Proxy / Router   │  (CPU only)
+   client  ───────▶ │    vllm-router     │  :30000   (CPU only)
+                    │  --policy round_robin
+                    │  --vllm-pd-disaggregation
                     └─────────┬──────────┘
                               │ 1. gửi prompt đi prefill
                               ▼
               ┌───────────────────────────────┐
-              │  PREFILL instance    [GPU 0]  │
+              │  PREFILL instance    [GPU 0]  │  :8001
               │  kv_role: kv_producer         │
+              │  NIXL side channel  :5557     │
               │  - prefill 8k-128k token      │
               │  - KHÔNG speculative decoding │
               │  - max_num_batched_tokens lớn │
@@ -40,10 +43,11 @@ Bài này tách hẳn hai giai đoạn thành **hai engine trên hai GPU riêng*
                               │    (NVLink / RDMA / UCX)
                               ▼
               ┌───────────────────────────────┐
-              │  DECODE instance     [GPU 1]  │
+              │  DECODE instance     [GPU 1]  │  :8002
               │  kv_role: kv_consumer         │
+              │  NIXL side channel  :5558     │
               │  + DSpark speculative decoding│
-              │  - nhận KV, chỉ sinh token    │
+              │  + cudagraph FULL_DECODE_ONLY │
               │  - max_num_seqs lớn           │
               └───────────────┬───────────────┘
                               │ 3. stream token về client
@@ -150,7 +154,7 @@ kubectl logs -f job/gpu-topology -n token-factory
 
 Tìm `NV#` trong ma trận (ví dụ `NV18`) giữa GPU0 và GPU1 — nghĩa là có NVLink. Nếu chỉ thấy `PHB`/`SYS`, KV transfer sẽ đi qua PCIe, chậm hơn nhưng vẫn dùng được.
 
-## Bước 2: Deploy prefill + decode + proxy
+## Bước 2: Deploy prefill + decode + router
 
 ```bash
 kubectl get pods -n token-factory     # xác nhận bài 03 đã xoá
@@ -159,51 +163,101 @@ kubectl apply -f deployment.yaml
 
 File này tạo 3 thành phần:
 
-| Thành phần | Vai trò | GPU | Speculative decoding |
-|---|---|---|---|
-| `vllm-prefill` | `kv_producer`, port 8000 | 1 (GPU 0) | Không |
-| `vllm-decode` | `kv_consumer`, port 8000 | 1 (GPU 1) | **DSpark** |
-| `pd-proxy` | Điều phối request, port 8192 | 0 | — |
+| Thành phần | Vai trò | Port | GPU | Speculative decoding |
+|---|---|---|---|---|
+| `vllm-prefill` | `kv_producer` | 8001 | 1 (GPU 0) | Không |
+| `vllm-decode` | `kv_consumer` | 8002 | 1 (GPU 1) | **DSpark** |
+| `vllm-router` | Điều phối PD | 30000 | 0 | — |
 
 Theo dõi (lần này phải chờ **hai** engine cùng load):
 
 ```bash
 kubectl logs -f deploy/vllm-prefill -n token-factory
 kubectl logs -f deploy/vllm-decode  -n token-factory
-kubectl logs -f deploy/pd-proxy     -n token-factory
+kubectl logs -f deploy/vllm-router  -n token-factory
 ```
 
 > Không cần time-slicing, không cần MPS, không cần chia `--gpu-memory-utilization` thủ công. Mỗi pod xin `nvidia.com/gpu: 1` và device plugin tự cấp một GPU riêng cho mỗi pod. Đây là một lợi ích phụ không nhỏ của việc làm đúng: **cấu hình đơn giản hơn hẳn, và có cách ly lỗi thật** — một engine OOM không kéo engine kia xuống.
 
 ### Giải thích cấu hình KV transfer
 
-**Instance prefill:**
+Phần này bám theo mẫu triển khai PD chuẩn của vLLM. Nếu bạn quen với ví dụ chạy tay bằng `vllm serve`, đây là bản dịch sang Kubernetes — cùng một bộ cờ.
+
+**Instance prefill (port 8001):**
 
 ```yaml
+- --block-size=128
+- --port=8001
 - '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
 ```
 
-**Instance decode:**
+**Instance decode (port 8002):**
 
 ```yaml
+- --block-size=128
+- --port=8002
 - '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
+- '--compilation-config={"cudagraph_mode":"FULL_DECODE_ONLY"}'
 ```
 
-| Khoá | Ý nghĩa |
+| Cờ | Ý nghĩa |
 |---|---|
-| `kv_connector: NixlConnector` | NIXL là lớp truyền KV được khuyến nghị của vLLM — send/recv hoàn toàn bất đồng bộ, hỗ trợ nhiều backend (UCX, GDS, RDMA) |
-| `kv_role` | `kv_producer` = bên prefill sinh KV; `kv_consumer` = bên decode tiêu thụ KV |
-| `kv_load_failure_policy: fail` | Nếu truyền KV thất bại thì **báo lỗi rõ ràng** thay vì âm thầm tính lại prefill. Khi học, luôn để `fail` — nếu không bạn sẽ benchmark một hệ thống đang lặng lẽ chạy sai mà không biết |
+| `kv_connector: NixlConnector` | Lớp truyền KV được khuyến nghị của vLLM — send/recv bất đồng bộ, hỗ trợ UCX/GDS/RDMA |
+| `kv_role` | `kv_producer` = bên prefill sinh KV; `kv_consumer` = bên decode tiêu thụ |
+| `kv_load_failure_policy: fail` | Truyền KV hỏng thì **báo lỗi rõ ràng** thay vì âm thầm tính lại prefill. Khi học, luôn để `fail` — nếu không bạn sẽ benchmark một hệ thống đang lặng lẽ chạy sai |
+| `--block-size 128` | KV được truyền theo **block**. Mặc định 16 là tối ưu cho agg mode; với PD, block lớn nghĩa là ít lần truyền hơn, mỗi lần nhiều dữ liệu hơn. **Phải giống nhau ở cả hai engine** — khác nhau thì NIXL không ghép được block |
+| `cudagraph_mode: FULL_DECODE_ONLY` | **Chỉ có ở decode.** Engine này không bao giờ chạy prefill, nên chỉ cần capture CUDA graph cho đường decode |
 
-Và biến môi trường bắt buộc:
+> **`FULL_DECODE_ONLY` là một tối ưu chỉ tồn tại được khi đã tách PD.** Ở agg mode (bài 01–03), engine phải giữ đầy đủ graph cho cả prefill lẫn decode vì nó làm cả hai. Tách ra rồi, engine decode vứt bỏ được một nửa số graph — nhanh khởi động hơn, tốn ít bộ nhớ graph hơn, và quan trọng nhất với bài này: **graph của nhánh speculative ít bị phá vỡ hơn**. Đây là ví dụ rõ nhất cho luận điểm "tách ra để tối ưu riêng từng nửa".
+
+### Biến môi trường NIXL
 
 ```yaml
+# prefill
+- name: VLLM_NIXL_SIDE_CHANNEL_HOST
+  valueFrom:
+    fieldRef: { fieldPath: status.podIP }     # <- K8s: lấy pod IP
 - name: VLLM_NIXL_SIDE_CHANNEL_PORT
-  value: "5600"        # prefill
-  # value: "5601"      # decode — PHẢI khác nhau NẾU cùng node
+  value: "5557"
+- name: GLOO_SOCKET_IFNAME
+  value: "eth0"
+- name: NCCL_SOCKET_IFNAME
+  value: "eth0"
+
+# decode: giống hệt, chỉ khác PORT = 5558
 ```
 
-Side channel là kênh **bắt tay ban đầu** giữa prefill và decode (trao đổi metadata về vùng nhớ). Hai instance trên cùng một host bắt buộc dùng port khác nhau; manifest đã đặt sẵn 5600/5601 nên an toàn trong cả hai trường hợp.
+| Biến | Vì sao cần |
+|---|---|
+| `VLLM_NIXL_SIDE_CHANNEL_HOST` | Địa chỉ mà bên kia **gọi tới được** để bắt tay. Khi chạy tay bạn đặt nó bằng hostname của node; trong K8s, IP của pod thay đổi mỗi lần restart nên ta lấy động qua **downward API** (`status.podIP`) thay vì hardcode |
+| `VLLM_NIXL_SIDE_CHANNEL_PORT` | Kênh trao đổi metadata vùng nhớ. Hai instance **phải khác port** nếu cùng host — ở đây là 5557/5558 |
+| `GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME` | Chỉ định interface mạng cho collective communication. Đặt `eth0` đúng với hầu hết CNI; nếu cluster dùng tên khác, chạy `ip -o link` trong pod để xem |
+| `UCX_NET_DEVICES=all` | Cho UCX dùng mọi thiết bị khả dụng (NVLink, IB, TCP) |
+
+### Router: `vllm-router`
+
+```bash
+vllm-router \
+  --policy round_robin \
+  --vllm-pd-disaggregation \
+  --prefill http://vllm-prefill:8001 \
+  --decode  http://vllm-decode:8002 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --intra-node-data-parallel-size 1
+```
+
+| Cờ | Ý nghĩa |
+|---|---|
+| `--vllm-pd-disaggregation` | **Cờ quan trọng nhất.** Bật giao thức PD: router gửi request sang prefill trước, đợi KV được sản xuất xong, rồi mới chuyển tiếp sang decode để sinh token. Thiếu cờ này router sẽ hoạt động như load balancer thường và toàn bộ kiến trúc PD vô hiệu |
+| `--prefill` / `--decode` | Danh sách endpoint của từng pool. Thêm nhiều replica thì liệt kê nhiều URL |
+| `--policy round_robin` | Chính sách chọn instance trong pool. Với 1 replica mỗi bên thì chưa quan trọng; khi scale lên nhiều replica, đây là chỗ đáng thử `kv_aware` để tận dụng prefix cache |
+| `--intra-node-data-parallel-size 1` | Số DP rank trong mỗi node. Ta chạy TP1/DP1 nên để 1 |
+| `--port 30000` | Cổng client gọi vào. **Mọi lệnh benchmark trong bài này đều trỏ tới đây** |
+
+> **Vì sao dùng `vllm-router` chứ không phải một proxy tự viết.** Router này hiểu giao thức PD (thứ tự prefill → decode, truyền request id để hai bên ghép KV), có chính sách định tuyến, và là thành phần dùng được trong production. Một proxy tự viết rất dễ mắc lỗi "trả lời đúng nhưng KV không hề được truyền" — xem Bước 3.
+>
+> Trong workshop, image đã cài sẵn `vllm-router`. Ở nhà, cài bằng `uv pip install vllm-router` (manifest tự làm việc này nếu chưa có).
 
 ### Vì sao tham số hai bên khác nhau
 
@@ -214,6 +268,9 @@ Side channel là kênh **bắt tay ban đầu** giữa prefill và decode (trao 
 | `--speculative-config` | không có | DSpark (8 token) | Speculative decoding vô dụng ở prefill |
 | `--gpu-memory-utilization` | `0.88` | `0.88` | Mỗi bên có GPU riêng — không phải chia thủ công như khi dùng chung |
 | `--tensor-parallel-size` | `1` | `1` | Một engine = một GPU. PD dùng 2 GPU vì có **2 engine**, không phải vì tăng TP |
+| `--block-size` | `128` | `128` | **Phải giống nhau** — NIXL truyền KV theo block |
+| `--compilation-config` | không đặt | `FULL_DECODE_ONLY` | Decode không bao giờ prefill → chỉ cần graph cho đường decode |
+| `--port` | `8001` | `8002` | Router phân biệt hai pool theo port |
 | `--enable-prefix-caching` | có | có | Agent gửi lại system prompt mỗi lượt |
 
 > **`max_num_seqs` của decode được nâng lên 128** (bài 01–03 để 64). Đây là chỗ tách kiến trúc bắt đầu trả cổ tức: GPU decode không còn phải dành bộ nhớ và lịch chạy cho prefill, nên nó ôm được nhiều session đồng thời hơn. Hãy đối chiếu con số `Maximum concurrency` trong log của hai engine với bài 01.
@@ -224,7 +281,7 @@ Side channel là kênh **bắt tay ban đầu** giữa prefill và decode (trao 
 
 ```bash
 kubectl exec -it deploy/bench-client -n token-factory -- \
-  curl -s http://pd-proxy:8192/v1/chat/completions \
+  curl -s http://vllm-router:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.8-27b",
        "messages":[{"role":"user","content":"Giải thích thuật toán binary search và cài đặt bằng Go."}],
@@ -239,6 +296,9 @@ kubectl logs deploy/vllm-prefill -n token-factory | tail -20
 
 # Decode phải có generation token
 kubectl logs deploy/vllm-decode -n token-factory | tail -20
+
+# Router phải ghi nhận request đi qua CẢ HAI chặng
+kubectl logs deploy/vllm-router -n token-factory | tail -20
 ```
 
 Kiểm tra bắt tay NIXL đã thành công:
@@ -247,7 +307,13 @@ Kiểm tra bắt tay NIXL đã thành công:
 kubectl logs deploy/vllm-decode -n token-factory | grep -i "nixl"
 ```
 
-> **Cách sai phổ biến nhất:** hệ thống vẫn trả lời đúng, nhưng thực tế KV không được truyền — decode instance âm thầm tự prefill lại. Kết quả: benchmark trông "bình thường" nhưng bạn đang đo một kiến trúc hoàn toàn khác (thực chất là hai engine agg độc lập). Dấu hiệu nhận biết: log của decode có số lượng prompt token lớn. Nếu thấy vậy, kiểm tra side channel port và `kv_load_failure_policy`.
+> **Cách sai phổ biến nhất:** hệ thống vẫn trả lời đúng, nhưng thực tế KV không được truyền — decode instance âm thầm tự prefill lại. Kết quả: benchmark trông "bình thường" nhưng bạn đang đo một kiến trúc hoàn toàn khác (thực chất là hai engine agg độc lập sau load balancer). Ba dấu hiệu nhận biết:
+>
+> 1. Log của **decode** có số lượng prompt token lớn (đáng lẽ phải gần bằng 0).
+> 2. TTFT **không** cải thiện so với bài 01 dù đã thêm hẳn một GPU.
+> 3. Router log không cho thấy hai chặng riêng biệt.
+>
+> Nguyên nhân thường gặp theo thứ tự: thiếu cờ `--vllm-pd-disaggregation` ở router; `--block-size` hai bên khác nhau; side channel port trùng nhau; `VLLM_NIXL_SIDE_CHANNEL_HOST` trỏ sai địa chỉ.
 
 ## Bước 4: Benchmark
 
@@ -260,7 +326,7 @@ for C in 1 8 32 64; do
   vllm bench serve \
     --backend openai-chat \
     --endpoint /v1/chat/completions \
-    --base-url http://pd-proxy:8192 \
+    --base-url http://vllm-router:30000 \
     --model qwen3.8-27b \
     --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
     --dataset-name random \
@@ -288,7 +354,7 @@ Vì giờ có ngân sách KV cache đầy đủ ở cả hai bên, hãy chạy t
 for C in 128 192; do
   vllm bench serve \
     --backend openai-chat --endpoint /v1/chat/completions \
-    --base-url http://pd-proxy:8192 --model qwen3.8-27b \
+    --base-url http://vllm-router:30000 --model qwen3.8-27b \
     --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
     --dataset-name random \
     --random-prefix-len 2048 --random-input-len 8000 \
@@ -322,7 +388,7 @@ Terminal 1 — tải prefill nặng:
 
 ```bash
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
-  --base-url http://pd-proxy:8192 --model qwen3.8-27b \
+  --base-url http://vllm-router:30000 --model qwen3.8-27b \
   --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
   --dataset-name random --random-input-len 30000 --random-output-len 50 \
   --num-prompts 64 --max-concurrency 16 --request-rate inf --ignore-eos
@@ -332,7 +398,7 @@ Terminal 2 — đồng thời đo trải nghiệm single-user:
 
 ```bash
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
-  --base-url http://pd-proxy:8192 --model qwen3.8-27b \
+  --base-url http://vllm-router:30000 --model qwen3.8-27b \
   --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
   --dataset-name random --random-input-len 1000 --random-output-len 500 \
   --num-prompts 20 --max-concurrency 1 --request-rate inf --ignore-eos \
@@ -380,7 +446,16 @@ Với agentic coding (input dài, output dài), thường prefill là nút thắ
 
 ### Thử nghiệm mở rộng (nếu có thêm GPU)
 
-`deployment.yaml` cho phép đổi `replicas` của từng Deployment. Proxy nhận nhiều host qua `--prefiller-hosts`/`--decoder-hosts`, nhưng toy proxy chỉ phân phối đơn giản — với nhiều replica bạn nên chuyển sang router thật (xem [bài 99](../99-compare-results/)).
+`deployment.yaml` cho phép đổi `replicas` của từng Deployment. `vllm-router` nhận nhiều endpoint — liệt kê thêm URL vào `--prefill` / `--decode`:
+
+```bash
+vllm-router --policy round_robin --vllm-pd-disaggregation \
+  --prefill http://vllm-prefill-0:8001 --prefill http://vllm-prefill-1:8001 \
+  --decode  http://vllm-decode-0:8002 \
+  --host 0.0.0.0 --port 30000
+```
+
+Khi đã có nhiều replica, `--policy` trở nên đáng quan tâm: `round_robin` không biết gì về prefix cache, trong khi agentic coding gửi lại cùng system prompt mỗi lượt. Đây là lúc chính sách KV-aware sinh lời — xem [bài 99](../99-compare-results/).
 
 ### Ba câu hỏi để chốt bài
 
@@ -403,10 +478,14 @@ Kỳ vọng bài 04 cao hơn hoặc ổn định hơn, vì: (a) decode instance 
 |---|---|---|
 | Pod thứ hai kẹt `Pending` | Node chỉ có 1 GPU, hoặc GPU thứ hai đang bị pod cũ giữ | `kubectl describe node` xem `nvidia.com/gpu` allocatable và allocated. Xác nhận bài 03 đã xoá xong |
 | Cả hai pod trên node khác nhau, decode không nhận được KV | PVC `ReadWriteOnce` không mount được ở node thứ hai | Đổi sang `ReadWriteMany` (NFS), hoặc dùng `nodeAffinity` ép cùng node |
-| Decode treo, không sinh token | Bắt tay NIXL thất bại | Kiểm tra `VLLM_NIXL_SIDE_CHANNEL_PORT` hai bên khác nhau; Service `nixl` đã expose; xem log tìm `nixl` |
+| Decode treo, không sinh token | Bắt tay NIXL thất bại | Kiểm tra: `VLLM_NIXL_SIDE_CHANNEL_PORT` hai bên khác nhau (5557/5558); `VLLM_NIXL_SIDE_CHANNEL_HOST` lấy đúng pod IP; Service `nixl` đã expose; xem log tìm `nixl` |
+| `NCCL`/`Gloo` không kết nối được | Sai tên interface mạng | Chạy `kubectl exec ... -- ip -o link` xem tên thật, rồi sửa `GLOO_SOCKET_IFNAME`/`NCCL_SOCKET_IFNAME` (mặc định manifest đặt `eth0`) |
+| KV truyền được nhưng rất chậm | `--block-size` quá nhỏ | Xác nhận cả hai engine đều `--block-size 128`. Hai bên khác nhau thì NIXL không ghép được block |
+| Router trả lời nhưng TTFT không cải thiện | Thiếu `--vllm-pd-disaggregation` | Không có cờ này, router chạy như load balancer thường và PD vô hiệu. Kiểm tra log router |
+| `vllm-router: command not found` | Image chưa bake sẵn package | Manifest tự `pip install vllm-router`. Nếu node không có internet, hãy yêu cầu image đã cài sẵn |
 | Request trả về nhưng rất chậm | KV không được truyền, decode tự prefill lại | Xem log decode có prompt token lớn không. Giữ `kv_load_failure_policy: fail` để lỗi nổi lên rõ ràng |
 | TTFT tệ hơn hẳn bài 01 | KV transfer đi qua PCIe/Ethernet thay vì NVLink | Chạy `00-gpu-topology-job.yaml`. Nếu là `SYS`/`PHB`, cân nhắc đặt hai engine trên hai GPU có NVLink |
-| Proxy báo `connection refused` | Một trong hai engine chưa ready | Proxy phải khởi động **sau** cả hai; manifest đã có initContainer chờ sẵn |
+| Router báo `connection refused` | Một trong hai engine chưa ready | Router phải khởi động **sau** cả hai; manifest đã có initContainer chờ sẵn |
 | Throughput/GPU thấp hơn bài 03 | Có thể đúng với workload của bạn | Không phải lỗi. Xem [phần 2](#so-sánh-công-bằng-bài-04-dùng-2-gpu-bài-01-03-dùng-1-gpu) — hãy so cả TPOT p99 trước khi kết luận |
 
 ## Dọn dẹp
@@ -414,6 +493,9 @@ Kỳ vọng bài 04 cao hơn hoặc ổn định hơn, vì: (a) decode instance 
 ```bash
 kubectl delete -f deployment.yaml
 kubectl wait --for=delete pod -l lab=04-pd-dspark -n token-factory --timeout=300s
+
+# Job kiểm tra topology (nếu đã chạy)
+kubectl delete job gpu-topology -n token-factory --ignore-not-found
 ```
 
 ---
