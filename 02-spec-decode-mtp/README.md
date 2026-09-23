@@ -249,6 +249,56 @@ done
 | 32 | | | | | |
 | 64 | | | | | |
 
+<details>
+<summary><b>Số đo tham chiếu</b> — cùng cluster, cùng seed 42, cùng SPEED-Bench <code>throughput_8k</code>, 840 request mỗi bên</summary>
+
+| Conc | TPOT p50 base | TPOT p50 MTP | × | tok/s base | tok/s MTP | × | TTFT p50 base | TTFT p50 MTP | × | ITL p99 base | ITL p99 MTP |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 12.44 | **7.14** | **1.74×** | 76.7 | **131.0** | **1.71×** | 599 | 585 | 1.02× | 14 | 18 |
+| 8 | 16.56 | **12.19** | **1.36×** | 422.5 | **593.9** | **1.41×** | 2506 | **624** | **4.01×** | 19 | 269 |
+| 32 | 36.72 | **30.15** | **1.22×** | 885.1 | **990.1** | 1.12× | 2635 | **1044** | 2.52× | 438 | 455 |
+| 64 | 62.54 | **46.97** | 1.33× | 984.6 | 883.1 | **0.90×** | 2266 | **21135** | **0.11×** | 475 | 476 |
+
+Acceptance length đo từ hiệu số counter:
+
+| Mức | Δdrafts | Δaccepted | Acceptance length | Acceptance rate |
+|---|---:|---:|---:|---:|
+| c1 | 3.495 | 4.507 | **2.290** | 64.5% |
+| c8 | 29.309 | 34.677 | **2.183** | 59.2% |
+| c32 | 116.412 | 139.530 | **2.199** | 59.9% |
+| c64 | 234.500 | 277.386 | **2.183** | 59.1% |
+
+</details>
+
+### Dòng c64 là kết quả quan trọng nhất — MTP THUA baseline
+
+Hãy nhìn kỹ dòng cuối bảng. Ở concurrency 64:
+
+| | Baseline | MTP | |
+|---|---:|---:|---|
+| TPOT p50 | 62.54 ms | **46.97 ms** | MTP nhanh hơn 1.33× |
+| Output throughput | 984.6 tok/s | 883.1 tok/s | **MTP kém hơn 10%** |
+| TTFT p50 | 2266 ms | **21135 ms** | **MTP tệ hơn 9.3 lần** |
+| Thời lượng benchmark | 520 s | 580 s | MTP lâu hơn 11% |
+
+**MTP làm từng token nhanh hơn nhưng làm cả hệ thống chậm đi.**
+
+> **Đây là bài học đắt giá nhất của bài 02.** Nếu bạn chỉ theo dõi TPOT — chỉ số "tốc độ gõ" mà ai cũng nhìn — bạn sẽ kết luận MTP tốt ở mọi mức tải và bật nó vĩnh viễn. Thực tế ở giờ cao điểm nó làm người dùng chờ **21 giây** cho token đầu tiên thay vì 2 giây.
+
+**Cơ chế:** MTP mất 19% KV cache (39.47 → 36.25 GiB, xem Bước 1). Ở c64 với prompt 8k, ngân sách KV trở thành nút thắt — ít request nằm được trong bộ nhớ cùng lúc → hàng đợi dài ra → TTFT nổ tung. Đồng thời GPU đã bão hoà compute nên mỗi draft token bị từ chối là lãng phí thuần.
+
+Hai nguyên nhân này **cộng dồn**, và đó là lý do điểm giao đến sớm hơn bạn nghĩ.
+
+### Khuyến nghị vận hành rút ra từ số liệu
+
+| Tải | Quyết định | Căn cứ |
+|---|---|---|
+| c1–c8 (giờ thường) | **Bật MTP** | Tăng tốc 1.4–1.7×, TTFT cũng tốt hơn |
+| c32 | **Bật**, lợi ích đã mỏng | Throughput chỉ +12% |
+| c64 (cao điểm) | **Tắt MTP** | Throughput −10%, TTFT tệ 9× |
+
+Phải bật/tắt thủ công theo giờ là một gánh nặng vận hành thật. Đó chính xác là vấn đề mà **adaptive verification** ở [bài 03](../03-spec-decode-dspark/) sinh ra để giải quyết.
+
 ### Quy luật bạn sẽ quan sát được
 
 **Tăng tốc lớn nhất ở concurrency thấp, giảm dần khi concurrency tăng.** Đây không phải lỗi cấu hình — đây là bản chất:
@@ -294,35 +344,52 @@ Hệ quả vận hành rất cụ thể: **đừng dùng acceptance length để
 
 ## Bước 5: Tinh chỉnh `num_speculative_tokens`
 
-Thử 3 giá trị và đo cả acceptance lẫn throughput:
+Sau khi đọc [warning về giới hạn một lớp MTP](#một-warning-bạn-sẽ-thấy-và-nó-quan-trọng), bước này không còn là tuỳ chọn. Giả thuyết cần kiểm chứng:
+
+> Qwen3.8 chỉ có một lớp MTP. Token t+2 được đoán bởi lớp không huấn luyện cho vị trí đó, nên hay bị từ chối — mà vẫn tốn compute verify. **Rất có thể `num_speculative_tokens = 1` cho throughput tốt hơn 2.**
+
+Sửa giá trị trong `deployment.yaml` rồi rollout lại:
 
 ```bash
-# Sửa giá trị trong deployment rồi rollout lại
-kubectl set env deploy/vllm-mtp -n token-factory --list   # xem cấu hình hiện tại
-```
-
-Cách nhanh hơn: sửa `deployment.yaml`, đổi `num_speculative_tokens`, rồi:
-
-```bash
+# Sửa "num_speculative_tokens":2 thành 1 trong deployment.yaml
 kubectl apply -f deployment.yaml
-kubectl rollout status deploy/vllm-mtp -n token-factory
+kubectl rollout status deploy/vllm-mtp -n token-factory --timeout=900s
 ```
 
-Ghi lại bảng này (chỉ cần chạy ở concurrency 1 và 32):
+> **`strategy: Recreate` trong manifest là bắt buộc, không phải tuỳ chọn.**
+>
+> Mặc định K8s dùng `RollingUpdate`: nó khởi động pod mới **trước khi** xoá pod cũ. Cả hai cùng xin `nvidia.com/gpu: 1`, nên trên node chỉ có 1 GPU pod mới sẽ kẹt `Pending` vĩnh viễn và `rollout status` treo cho tới hết timeout.
+>
+> Với `Recreate`, K8s xoá pod cũ xong mới tạo pod mới — đúng thứ bạn cần khi tài nguyên không chia sẻ được. Mọi deployment trong chuỗi bài đều đặt cờ này.
 
-| `num_speculative_tokens` | Acceptance length | TPOT p50 @c1 | Output tok/s @c32 |
-|---|---|---|---|
-| 1 | | | |
-| 2 | | | |
-| 3 | | | |
+Ghi lại bảng này (chỉ cần chạy ở concurrency 1 và 32 là đủ để thấy xu hướng):
 
-**Đánh đổi bạn đang đo:**
+| `num_speculative_tokens` | Acceptance length | TPOT p50 @c1 | Output tok/s @c1 | Output tok/s @c32 |
+|---|---|---|---|---|
+| 1 | | | | |
+| 2 | **2.29** | **7.14 ms** | **131.0** | **990.1** |
+| 3 | | | | |
 
-- Tăng `num_speculative_tokens` → mỗi bước có thể chấp nhận nhiều token hơn → **acceptance length tăng**.
-- Nhưng token thứ k chỉ được chấp nhận nếu cả k−1 token trước đó đều được chấp nhận → xác suất giảm theo cấp số nhân → **acceptance rate giảm**.
-- Và mỗi draft token bị từ chối vẫn tốn compute verify.
+(Dòng `2` đã có sẵn từ Bước 3 — đó là cấu hình bạn vừa đo.)
 
-Có một điểm tối ưu, thường là 2–3 cho MTP. **Điểm tối ưu này phụ thuộc workload và mức concurrency của bạn** — đó là lý do bài này bắt bạn tự đo thay vì cho sẵn con số.
+### Đánh đổi bạn đang đo
+
+- Tăng `num_speculative_tokens` → mỗi bước **có thể** chấp nhận nhiều token hơn → acceptance length tăng.
+- Nhưng token thứ k chỉ được chấp nhận nếu **cả k−1 token trước đó** đều được chấp nhận → xác suất giảm theo cấp số nhân.
+- Và mỗi draft token bị từ chối **vẫn tốn compute verify**.
+- **Riêng với Qwen3.8**, còn một yếu tố nữa: token thứ 2 trở đi dùng lại cùng một lớp MTP, nên chất lượng dự đoán ở các vị trí sau kém hơn hẳn một drafter đa lớp.
+
+Với acceptance rate đo được là **59–64%**, xác suất token thứ hai được chấp nhận chỉ khoảng 0.6² ≈ **36%**. Nghĩa là gần 2/3 số lần bạn trả tiền verify cho một token bị vứt đi.
+
+### Cách đọc kết quả
+
+| Nếu thấy | Kết luận |
+|---|---|
+| `1` cho throughput cao hơn `2` | Giới hạn một lớp MTP đang chi phối. Dùng `1` |
+| `2` vẫn tốt hơn `1` | Token thứ hai đủ hữu ích để bù chi phí. Thử tiếp `3` |
+| `3` tệ hơn `2` | Đã qua điểm tối ưu, quay lại `2` |
+
+**Điểm tối ưu phụ thuộc workload và mức concurrency của bạn** — đó là lý do bài này bắt bạn tự đo thay vì cho sẵn con số. Và nó là một lý lẽ nữa cho adaptive verification ở bài 03: thay vì chọn cứng một giá trị, để engine tự quyết theo từng bước.
 
 ## Dọn dẹp
 

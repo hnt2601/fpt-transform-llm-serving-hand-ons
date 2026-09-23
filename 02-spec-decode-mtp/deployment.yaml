@@ -12,6 +12,12 @@ metadata:
     lab: "02-mtp"
 spec:
   replicas: 1
+  # Recreate (khong phai RollingUpdate mac dinh): xoa pod cu XONG moi tao
+  # pod moi. Voi RollingUpdate, K8s khoi dong pod moi TRUOC khi xoa pod cu
+  # (maxSurge=1), nen ca hai cung xin GPU -> tren node 1 GPU pod moi se
+  # ket Pending vinh vien va rollout khong bao gio xong.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vllm-mtp
@@ -74,7 +80,7 @@ spec:
             #               Bài 02 Bước 5 hướng dẫn tinh chỉnh giá trị này.
             #               Nếu image báo lỗi, hạ về 1 rồi tăng dần.
             # ======================================================
-            - '--speculative-config={"method":"mtp","num_speculative_tokens":2}'
+            - '--speculative-config={"method":"mtp","num_speculative_tokens":1}'
           env:
             - name: HF_TOKEN
               valueFrom:

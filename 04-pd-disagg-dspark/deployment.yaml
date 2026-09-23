@@ -39,6 +39,12 @@ metadata:
     pd-role: prefill
 spec:
   replicas: 1
+  # Recreate (khong phai RollingUpdate mac dinh): xoa pod cu XONG moi tao
+  # pod moi. Voi RollingUpdate, K8s khoi dong pod moi TRUOC khi xoa pod cu
+  # (maxSurge=1), nen ca hai cung xin GPU -> tren node 1 GPU pod moi se
+  # ket Pending vinh vien va rollout khong bao gio xong.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vllm-prefill
@@ -193,6 +199,12 @@ metadata:
     pd-role: decode
 spec:
   replicas: 1
+  # Recreate (khong phai RollingUpdate mac dinh): xoa pod cu XONG moi tao
+  # pod moi. Voi RollingUpdate, K8s khoi dong pod moi TRUOC khi xoa pod cu
+  # (maxSurge=1), nen ca hai cung xin GPU -> tren node 1 GPU pod moi se
+  # ket Pending vinh vien va rollout khong bao gio xong.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vllm-decode
@@ -364,6 +376,12 @@ metadata:
     lab: "04-pd-dspark"
 spec:
   replicas: 1
+  # Recreate (khong phai RollingUpdate mac dinh): xoa pod cu XONG moi tao
+  # pod moi. Voi RollingUpdate, K8s khoi dong pod moi TRUOC khi xoa pod cu
+  # (maxSurge=1), nen ca hai cung xin GPU -> tren node 1 GPU pod moi se
+  # ket Pending vinh vien va rollout khong bao gio xong.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vllm-router
