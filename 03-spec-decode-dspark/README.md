@@ -134,18 +134,34 @@ model.safetensors    3.98 GB
 
 > Nếu bạn thấy thêm `optimizer_state_dict.pt` (4.23 GB), nghĩa là job ở bài 00 đã tải cả repo. File đó là state của Muon optimizer dùng để **tiếp tục huấn luyện**, vLLM không bao giờ đọc tới. Xoá được an toàn.
 
-**Ngân sách bộ nhớ cập nhật:**
+**Ngân sách bộ nhớ — và một bất ngờ khó chịu**
+
+Phép tính "trên giấy" trông ổn:
 
 ```
 Tổng HBM                                  80.0 GB
-- CUDA context + activation + graphs   ≈   4.5 GB
+- CUDA context + activation            ≈   4.5 GB
 - Trọng số target FP8                  ≈  27.5 GB
 - Trọng số speculator (BF16, 5 lớp)    ≈   4.0 GB
                                          ─────────
-  Còn lại cho KV cache                 ≈  44.0 GB
+  Còn lại (lý thuyết)                  ≈  44.0 GB
 ```
 
-Speculator tốn thêm 4.0 GB — chấp nhận được, nhưng ta hạ `--gpu-memory-utilization` xuống `0.86` để chừa chỗ cho CUDA graph của cả hai nhánh. KV cache còn ~33 GB (≈1.05 triệu token), vẫn thừa sức cho `--max-model-len 131072`.
+**Số đo thật lại khác xa** (log ở Bước 1):
+
+| | Bài 01 baseline | Bài 02 MTP | **Bài 03 DSpark** |
+|---|---:|---:|---:|
+| `--gpu-memory-utilization` | 0.90 | 0.88 | 0.86 |
+| KV cache | 39.47 GiB | 36.25 GiB | **28.58 GiB** |
+| Số token | 1.200.036 | 973.279 | **550.320** |
+| Session @128k | 9.16 | 7.43 | **4.20** |
+| Mất so với baseline | — | −19% | **−54%** |
+
+> **DSpark ăn mất hơn một nửa KV cache.** Trọng số speculator chỉ 4 GB, nhưng phần hụt là **~11 GB** so với baseline. Phần chênh nằm ở **CUDA graph**: DSpark verify 8 token mỗi bước thay vì 1, nên bộ graph cho nhánh verify lớn hơn hẳn — và vLLM phải capture graph cho cả backbone drafter lẫn đường verify mở rộng.
+>
+> Đây là chi phí mà phép tính "trọng số + context" **không nhìn thấy được**. Luôn đọc số thật từ log `Available KV cache memory` thay vì tin ước lượng trên giấy.
+
+Hệ quả cần theo dõi ở Bước 4: [bài 02 đã cho thấy](../02-spec-decode-mtp/#dòng-c64-là-kết-quả-quan-trọng-nhất--mtp-thua-baseline) MTP **thua baseline ở c64** chỉ với −19% KV cache. DSpark mất −54%. Acceptance length gấp đôi liệu có bù nổi không? Số liệu sẽ trả lời.
 
 Speculator chạy cùng GPU với target ở **TP1** — nó chỉ 5 lớp nên không có lý do gì phải chia qua nhiều GPU.
 
