@@ -107,7 +107,35 @@ Giải thích từng khoá:
 
 Ngoài ra `--gpu-memory-utilization` giảm nhẹ xuống `0.88`: bộ verify cần thêm bộ đệm cho draft token và CUDA graph của nhánh speculative.
 
-> **Nếu gặp lỗi.** Với một số bản vLLM, `num_speculative_tokens > 1` trên dòng Qwen3.5/3.8 có thể báo lỗi tuỳ số MTP step mà checkpoint có. Nếu vậy hãy hạ về `1`, xác nhận chạy được, rồi mới tăng dần. Bạn cũng có thể thấy warning về multimodal processor — Qwen3.8 là vision-language model và draft MTP kế thừa đường multimodal của target; warning này vô hại với workload text thuần.
+### Ba dòng log xác nhận MTP đang chạy
+
+```
+Resolved architecture: Qwen3_5MTP
+speculative_config=SpeculativeConfig(method='mtp',
+                                     model='/models/Qwen/Qwen3.8-27B-FP8',
+                                     num_spec_tokens=2)
+Overriding draft model max model len from 262144 to 131072
+```
+
+Chú ý dòng giữa: `model` trỏ về **chính đường dẫn model target**. Đây là bằng chứng cụ thể cho điều đã nói ở phần 2 — MTP không cần checkpoint rời, vLLM tự dựng draft model từ trọng số đã có (`mtp.safetensors` bên trong thư mục target).
+
+### Một warning bạn SẼ thấy, và nó quan trọng
+
+```
+WARNING [speculative.py:1318] Enabling num_speculative_tokens > 1 will run
+multiple times of forward on same MTP layer, which may result in lower
+acceptance rate
+```
+
+> **Đọc kỹ dòng này — nó nói về giới hạn kiến trúc, không phải lỗi cấu hình.**
+>
+> Qwen3.8 chỉ có **một** lớp MTP. Khi bạn đặt `num_speculative_tokens = 2`, vLLM **chạy đi chạy lại cùng một lớp đó** để sinh token thứ hai, thay vì dùng một lớp riêng được huấn luyện cho vị trí t+2.
+>
+> Hệ quả: token thứ hai được đoán bởi một lớp **không hề được huấn luyện cho vị trí đó**, nên xác suất chấp nhận thấp hơn hẳn token thứ nhất. Đây chính là lý do Bước 5 bắt bạn đo cả `num_speculative_tokens = 1` — rất có thể giá trị 1 lại cho throughput tốt hơn 2, vì token thứ hai gần như luôn bị từ chối mà vẫn tốn compute verify.
+>
+> Đối chiếu với bài 03: DSpark có backbone riêng 5 lớp được huấn luyện để dự đoán **cả block 8 token**, nên không gặp giới hạn này. Đó là phần lớn lý do acceptance length của nó cao gấp đôi.
+
+Bạn cũng có thể thấy warning về multimodal processor — Qwen3.8 là vision-language model và draft MTP kế thừa đường multimodal của target; warning này vô hại với workload text thuần.
 
 ## Bước 2: Kiểm tra acceptance
 
