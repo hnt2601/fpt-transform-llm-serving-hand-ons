@@ -18,7 +18,7 @@ metadata:
   name: dataset-prep
   namespace: token-factory
 spec:
-  backoffLimit: 2
+  backoffLimit: 10
   template:
     metadata:
       labels:
@@ -35,8 +35,15 @@ spec:
                 secretKeyRef:
                   name: hf-token
                   key: token
+            # TẮT hf_transfer: trên đường truyền chậm/không ổn định nó
+            # hay đứt giữa chừng và KHÔNG resume được.
             - name: HF_HUB_ENABLE_HF_TRANSFER
-              value: "1"
+              value: "0"
+            # Mặc định chỉ 10s -> FSTimeoutError khi nguồn ngoài chỉ vài kB/s.
+            - name: HF_HUB_DOWNLOAD_TIMEOUT
+              value: "300"
+            - name: HF_HUB_ETAG_TIMEOUT
+              value: "60"
             # Cache HF nằm trên PVC để lần chạy sau không tải lại
             - name: HF_HOME
               value: /datasets/.hf-cache
@@ -71,8 +78,29 @@ spec:
 
               echo "==> [3/3] Sinh ${SUBSET}.jsonl vào ${OUT}"
               # prepare.py tải nvidia/SPEED-Bench + vài dataset ngoài
-              # (LiveCodeBench, ...) rồi ghi ra <output_dir>/<config>.jsonl
-              python3 /tmp/prepare.py --config "${SUBSET}" --output_dir "${OUT}"
+              # (LiveCodeBench, ...) rồi ghi ra <output_dir>/<config>.jsonl.
+              #
+              # Các nguồn ngoài rất chậm và hay timeout. Thử lại nhiều lần
+              # NGAY TRONG container: cache HF nằm trên PVC nên mỗi lần thử
+              # tiếp tục từ chỗ đã tải, không bắt đầu lại từ đầu.
+              ATTEMPTS=12
+              for i in $(seq 1 ${ATTEMPTS}); do
+                echo "--- lần thử ${i}/${ATTEMPTS} ---"
+                if python3 /tmp/prepare.py --config "${SUBSET}" --output_dir "${OUT}"; then
+                  echo "--- thành công ở lần thử ${i} ---"
+                  break
+                fi
+                if [ "${i}" = "${ATTEMPTS}" ]; then
+                  echo "THẤT BẠI sau ${ATTEMPTS} lần thử."
+                  echo "Nguyên nhân thường gặp: đường mạng ra HuggingFace quá chậm"
+                  echo "(nguồn ngoài như LiveCodeBench chỉ vài kB/s) -> FSTimeoutError."
+                  echo "Cách xử lý: chạy lại job (cache trên PVC được giữ), hoặc"
+                  echo "tải dataset ở nơi có mạng tốt rồi copy vào PVC bench-datasets."
+                  exit 1
+                fi
+                echo "--- lỗi, chờ 15s rồi thử lại (cache được giữ) ---"
+                sleep 15
+              done
 
               echo
               echo "==> Hoàn tất"

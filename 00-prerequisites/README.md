@@ -324,9 +324,33 @@ Job dưới đây chỉ tải `throughput_8k` (đủ cho sweep chính). Muốn c
 
 ```bash
 kubectl apply -f 07-dataset-prep-job.yaml
-kubectl wait --for=condition=complete job/dataset-prep -n token-factory --timeout=2400s || true
-kubectl logs job/dataset-prep -n token-factory
+
+# Job có thể chạy 10-30 phút, xem giải thích bên dưới.
+kubectl wait --for=condition=complete job/dataset-prep -n token-factory --timeout=3600s || true
+kubectl logs job/dataset-prep -n token-factory --tail=20
 ```
+
+> **Job chạy lâu là bình thường, đừng huỷ giữa chừng.** `prepare.py` không chỉ tải `nvidia/SPEED-Bench` (nhỏ, vài MB) mà còn kéo dữ liệu gốc từ các dataset ngoài như LiveCodeBench. Những nguồn này thường **rất chậm** — quan sát thực tế chỉ vài kB/s:
+>
+> ```
+> Downloading data: 295kB [02:06, 5.90kB/s]
+> ```
+>
+> Theo dõi tiến độ bằng `kubectl logs -f job/dataset-prep -n token-factory`. Chừng nào con số còn tăng thì job vẫn chạy.
+>
+> Đây chính là lý do PVC `bench-datasets` nằm trên shared storage và job được viết **idempotent**: trong workshop chỉ một người phải chịu lần tải đầu, cả lớp dùng chung.
+
+### Xử lý sự cố khi tải dataset
+
+| Triệu chứng | Nguyên nhân | Cách xử lý |
+|---|---|---|
+| `fsspec.exceptions.FSTimeoutError` | Nguồn ngoài (LiveCodeBench) quá chậm, vượt timeout mặc định **10 giây** của HuggingFace Hub | Job đã đặt `HF_HUB_DOWNLOAD_TIMEOUT=300` và thử lại 12 lần. Nếu vẫn thất bại, chạy lại job — cache trên PVC được giữ nên nó tiếp tục từ chỗ dở |
+| Pod restart, log quay về `[1/3]` | Container thoát với lỗi, `restartPolicy: OnFailure` khởi động lại | Bình thường. Kiểm tra bằng `kubectl logs <pod> --previous` xem lỗi thật |
+| `curl: command not found` | Chép nguyên lệnh trong tài liệu vLLM vào container không có `curl` | Job này tải bằng `urllib` của Python |
+| Tải rất chậm rồi đứt | `hf_transfer` không resume được trên đường truyền không ổn định | Job đã đặt `HF_HUB_ENABLE_HF_TRANSFER=0` |
+| Hết cách | Mạng của cluster quá tệ với nguồn ngoài | Tải dataset ở máy có mạng tốt rồi copy `throughput_8k.jsonl` vào PVC: `kubectl cp throughput_8k.jsonl token-factory/<pod>:/datasets/speed-bench/` |
+
+> **Vì sao cache HuggingFace đặt trên PVC (`HF_HOME=/datasets/.hf-cache`).** Đây không phải tối ưu vặt: nó là thứ khiến việc thử lại có ý nghĩa. Mỗi lần thử tiếp tục từ phần đã tải thay vì bắt đầu lại từ đầu — với nguồn chỉ vài kB/s, khác biệt này là giữa "xong sau vài lần thử" và "không bao giờ xong".
 
 Kết quả mong đợi:
 
