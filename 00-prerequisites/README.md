@@ -340,6 +340,29 @@ kubectl logs job/dataset-prep -n token-factory --tail=20
 >
 > Đây chính là lý do PVC `bench-datasets` nằm trên shared storage và job được viết **idempotent**: trong workshop chỉ một người phải chịu lần tải đầu, cả lớp dùng chung.
 
+### Vấn đề dataset gated `cais/hle`
+
+`throughput_8k` có **268/1536 bản ghi (17%)** lấy nội dung từ [`cais/hle`](https://huggingface.co/datasets/cais/hle) (Humanity's Last Exam) — dataset **gated**, phải xin quyền thủ công. Không có quyền thì `prepare.py` của NVIDIA **dừng hẳn**:
+
+```
+datasets.exceptions.DatasetNotFoundError:
+Dataset 'cais/hle' is a gated dataset on the Hub.
+```
+
+> **Cạm bẫy:** `HfApi.dataset_info("cais/hle")` vẫn trả về OK kể cả khi chưa được cấp quyền — đó chỉ là metadata công khai. Chỉ khi **tải dữ liệu thật** mới lộ ra bị chặn. Đừng tin phép thử bằng `dataset_info`.
+
+Chuỗi bài xử lý bằng `prepare-speedbench.py` trong thư mục này: nó **lọc bỏ các bản ghi thuộc nguồn gated trước khi resolve**, nên chạy được ngay mà không cần xin quyền.
+
+| | Đầy đủ | Bỏ gated (mặc định) |
+|---|---|---|
+| `throughput_8k` | 1536 | **1268** |
+| `throughput_1k` | 1536 | **1273** |
+| `throughput_32k` | 1536 | **1103** |
+
+Phần bị bỏ là câu hỏi học thuật của HLE. Phần **giữ lại quan trọng hơn với chuỗi bài này**: `tianyang/repobench_python_v1.1` và `repobench_java_v1.1` — chính là dữ liệu code completion ở cấp repository, sát nhất với workload agentic coding.
+
+**Muốn bản đầy đủ:** xin quyền tại <https://huggingface.co/datasets/cais/hle>, đợi được duyệt, rồi chạy lại **không kèm** cờ `--skip-gated`.
+
 ### Xử lý sự cố khi tải dataset
 
 | Triệu chứng | Nguyên nhân | Cách xử lý |
@@ -348,7 +371,37 @@ kubectl logs job/dataset-prep -n token-factory --tail=20
 | Pod restart, log quay về `[1/3]` | Container thoát với lỗi, `restartPolicy: OnFailure` khởi động lại | Bình thường. Kiểm tra bằng `kubectl logs <pod> --previous` xem lỗi thật |
 | `curl: command not found` | Chép nguyên lệnh trong tài liệu vLLM vào container không có `curl` | Job này tải bằng `urllib` của Python |
 | Tải rất chậm rồi đứt | `hf_transfer` không resume được trên đường truyền không ổn định | Job đã đặt `HF_HUB_ENABLE_HF_TRANSFER=0` |
-| Hết cách | Mạng của cluster quá tệ với nguồn ngoài | Tải dataset ở máy có mạng tốt rồi copy `throughput_8k.jsonl` vào PVC: `kubectl cp throughput_8k.jsonl token-factory/<pod>:/datasets/speed-bench/` |
+| `DatasetNotFoundError: 'cais/hle' is a gated dataset` | Nguồn gated, chưa được cấp quyền | Dùng cờ bỏ qua gated (mặc định của job). Xem mục trên |
+| Hết cách | Mạng của cluster quá tệ với nguồn ngoài | **Tải ở máy có mạng tốt rồi copy vào PVC** — xem mục dưới |
+
+### Đường thoát: tải ở máy ngoài rồi copy vào PVC
+
+Cách này đáng tin nhất khi mạng cluster kém. Làm trên máy của bạn:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install datasets pandas tiktoken numpy
+
+curl -LsSf https://raw.githubusercontent.com/NVIDIA-NeMo/Skills/refs/heads/main/nemo_skills/dataset/speed-bench/prepare.py -o prepare.py
+
+for C in throughput_8k throughput_1k throughput_32k; do
+  .venv/bin/python prepare-speedbench.py \
+    --config $C --output_dir out --prepare prepare.py --skip-gated
+done
+```
+
+Rồi copy vào PVC. **Lưu ý: `bench-client` mount `/datasets` READ-ONLY**, nên cần một pod ghi được:
+
+```bash
+kubectl apply -f 08-dataset-uploader-pod.yaml
+kubectl wait --for=condition=ready pod/dataset-uploader -n token-factory --timeout=120s
+
+for C in throughput_8k throughput_1k throughput_32k; do
+  kubectl cp out/$C.jsonl token-factory/dataset-uploader:/datasets/speed-bench/$C.jsonl
+done
+
+kubectl exec dataset-uploader -n token-factory -- ls -la /datasets/speed-bench/
+kubectl delete pod dataset-uploader -n token-factory
+```
 
 > **Vì sao cache HuggingFace đặt trên PVC (`HF_HOME=/datasets/.hf-cache`).** Đây không phải tối ưu vặt: nó là thứ khiến việc thử lại có ý nghĩa. Mỗi lần thử tiếp tục từ phần đã tải thay vì bắt đầu lại từ đầu — với nguồn chỉ vài kB/s, khác biệt này là giữa "xong sau vài lần thử" và "không bao giờ xong".
 

@@ -1,0 +1,43 @@
+# Pod tạm để copy dataset từ máy ngoài vào PVC bench-datasets.
+#
+# VÌ SAO CẦN POD RIÊNG: bench-client mount /datasets ở chế độ READ-ONLY
+# (nó chỉ đọc dataset để benchmark). `kubectl cp` vào đó sẽ thất bại.
+#
+# Dùng:
+#   kubectl apply -f 08-dataset-uploader-pod.yaml
+#   kubectl wait --for=condition=ready pod/dataset-uploader -n token-factory --timeout=120s
+#   kubectl cp out/throughput_8k.jsonl \
+#     token-factory/dataset-uploader:/datasets/speed-bench/throughput_8k.jsonl
+#   kubectl exec dataset-uploader -n token-factory -- ls -la /datasets/speed-bench/
+#   kubectl delete pod dataset-uploader -n token-factory
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dataset-uploader
+  namespace: token-factory
+  labels:
+    app: dataset-uploader
+spec:
+  enableServiceLinks: false
+  restartPolicy: Never
+  containers:
+    - name: up
+      image: busybox:1.36
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c"]
+      args:
+        - |
+          mkdir -p /datasets/speed-bench
+          echo "sẵn sàng nhận kubectl cp vào /datasets/speed-bench"
+          # Sống 1 giờ rồi tự tắt, tránh bỏ quên pod chiếm PVC
+          sleep 3600
+      volumeMounts:
+        - name: bench-datasets
+          mountPath: /datasets
+      resources:
+        requests: { cpu: "500m", memory: 512Mi }
+        limits:   { cpu: "1",    memory: 1Gi }
+  volumes:
+    - name: bench-datasets
+      persistentVolumeClaim:
+        claimName: bench-datasets
