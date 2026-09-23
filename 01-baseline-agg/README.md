@@ -368,22 +368,65 @@ P99 ITL (ms):                            ...
 
 Điền vào bảng baseline (copy vào [99-compare-results/](../99-compare-results/)):
 
-| Concurrency | TTFT p50 (ms) | TTFT p99 (ms) | TPOT p50 (ms) | TPOT p99 (ms) | Output tok/s |
-|---|---|---|---|---|---|
-| 1 | | | | | |
-| 8 | | | | | |
-| 32 | | | | | |
-| 64 | | | | | |
+| Concurrency | TTFT p50 (ms) | TTFT p99 (ms) | TPOT p50 (ms) | TPOT p99 (ms) | ITL p99 (ms) | Output tok/s |
+|---|---|---|---|---|---|---|
+| 1 | | | | | | |
+| 8 | | | | | | |
+| 32 | | | | | | |
+| 64 | | | | | | |
+
+<details>
+<summary><b>Số đo tham chiếu</b> — 1× H100 80GB, vLLM 0.29.0, TP1, SPEED-Bench <code>throughput_8k</code></summary>
+
+| Conc | TTFT p50 | TTFT p99 | TPOT p50 | TPOT p99 | ITL p99 | out tok/s | req/s | E2EL p50 | thời lượng |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 599 | 623 | 12.44 | 12.46 | 14.20 | 76.7 | 0.077 | 13.0 s | 104 s |
+| 8 | 2506 | 4118 | 16.56 | 18.20 | 18.51 | 422.5 | 0.423 | 19.3 s | 152 s |
+| 32 | 2635 | 15552 | 36.72 | 38.44 | 437.99 | 885.1 | 0.885 | 39.6 s | 289 s |
+| 64 | 2266 | 31455 | 62.54 | 63.57 | 474.69 | 984.6 | 0.985 | 64.8 s | 520 s |
+
+Con số của bạn sẽ khác đôi chút (phiên bản driver, nhiễu từ tải khác trên node), nhưng **hình dạng đường cong phải giống**. Nếu không giống, kiểm tra lại cấu hình trước khi sang bài 02.
+
+</details>
 
 ### Ba điều phải nhận ra từ bảng này
 
-1. **Ở concurrency 1, TPOT p50 chính là "tốc độ gõ code" mà người dùng cảm nhận.** Số đo thật trên H100 80GB với cấu hình bài này: **TPOT p50 ≈ 12.9 ms → ~78 token/s**. Đây là **trần vật lý của decode tuần tự**, và không có cách nào vượt qua bằng cách chỉnh tham số batch. Chỉ speculative decoding mới phá được trần này — đó là bài 02 và 03.
+1. **Ở concurrency 1, TPOT p50 chính là "tốc độ gõ code" mà người dùng cảm nhận.** Số đo thật trên H100 80GB với cấu hình bài này: **TPOT p50 = 12.44 ms → 76.7 token/s**. Đây là **trần vật lý của decode tuần tự**, và không có cách nào vượt qua bằng cách chỉnh tham số batch. Chỉ speculative decoding mới phá được trần này — đó là bài 02 và 03.
 
-   Đối chiếu với phép tính băng thông ở [bài 02 mục 1](../02-spec-decode-mtp/#1-vì-sao-speculative-decoding-lại-hiệu-quả): 28.5 GB trọng số / 3.35 TB/s ≈ 8.5 ms là **cận dưới lý thuyết**. Thực đo 12.9 ms — phần chênh là overhead sampling, các lớp Gated DeltaNet và chi phí framework. Tỉ lệ đạt ~66% băng thông đỉnh là bình thường với model dense cỡ này.
+   Đối chiếu với phép tính băng thông ở [bài 02 mục 1](../02-spec-decode-mtp/#1-vì-sao-speculative-decoding-lại-hiệu-quả): 28.5 GB trọng số / 3.35 TB/s ≈ 8.5 ms là **cận dưới lý thuyết**. Thực đo 12.44 ms — phần chênh là overhead sampling, các lớp Gated DeltaNet và chi phí framework. Tỉ lệ đạt ~66% băng thông đỉnh là bình thường với model dense cỡ này.
 
-2. **TPOT tăng dần theo concurrency.** Batch lớn hơn → mỗi bước decode phải xử lý nhiều seq hơn → mỗi token chậm hơn, nhưng tổng throughput cao hơn. Đây là đánh đổi cơ bản latency ⇄ throughput.
+2. **TPOT tăng dần theo concurrency, và throughput bão hoà.** Batch lớn hơn → mỗi bước decode xử lý nhiều seq hơn → mỗi token chậm hơn, nhưng tổng throughput cao hơn. Đây là đánh đổi cơ bản latency ⇄ throughput.
 
-3. **TTFT p99 tăng vọt nhanh hơn TTFT p50.** Đó là dấu vết của decode interference: một request không may rơi đúng lúc hệ thống đang prefill 8k token của request khác.
+   Nhưng hãy xem kỹ chỗ nó **ngừng đáng giá**:
+
+   | Concurrency | TPOT so với c1 | Throughput so với c1 |
+   |---|---:|---:|
+   | 8 | 1.33× chậm hơn | **5.5×** |
+   | 32 | 2.95× chậm hơn | **11.5×** |
+   | 64 | 5.03× chậm hơn | **12.8×** |
+
+   Từ c32 lên c64: TPOT xấu đi **1.7 lần** nhưng throughput chỉ tăng **11%**. Đó là điểm bão hoà — sau đó bạn hy sinh trải nghiệm người dùng mà gần như không được gì.
+
+   **Với Token Factory, c32 là điểm vận hành hợp lý, không phải c64.** Đây là loại kết luận chỉ có được khi đo, không suy ra được từ lý thuyết.
+
+3. **TTFT p99 tăng vọt nhanh hơn hẳn TTFT p50— và đây là điều quan trọng nhất của cả bài 01.**
+
+   Số đo thật cho thấy độ lệch rất rõ:
+
+   | Concurrency | TTFT p50 | TTFT p99 | Tỉ lệ p99/p50 |
+   |---|---:|---:|---:|
+   | 1 | 599 ms | 623 ms | **1.0×** |
+   | 8 | 2506 ms | 4118 ms | **1.6×** |
+   | 32 | 2635 ms | 15552 ms | **5.9×** |
+   | 64 | 2266 ms | **31455 ms** | **13.9×** |
+
+   Chú ý dòng cuối: ở concurrency 64, TTFT p50 thậm chí **giảm nhẹ** so với c32 (2266 so với 2635 ms) trong khi p99 **tăng gấp đôi** lên 31 giây. Trung vị trông đẹp hơn trong khi trải nghiệm tệ nhất xấu đi gấp đôi.
+
+   > **Đây là lý do không bao giờ được đánh giá hệ thống serving chỉ bằng trung vị.** Nếu chỉ nhìn TTFT p50, bạn sẽ kết luận c64 tốt hơn c32. Thực tế là một phần người dùng phải chờ **nửa phút** cho token đầu tiên.
+
+   Cùng lúc đó, **ITL p99 nhảy từ 14 ms lên 475 ms** — người dùng thấy agent đang gõ code rồi đột ngột đứng hình gần nửa giây.
+
+   Đó là dấu vết của **decode interference**: một request không may rơi đúng lúc hệ thống đang prefill 8k token của request khác. Toàn bộ bài 04 (PD disaggregation) tồn tại để chữa đúng triệu chứng này.
 
 ## Bước 5: Quan sát điểm đau
 
