@@ -494,6 +494,21 @@ Vào shell để làm benchmark ở các bài sau:
 kubectl exec -it deploy/bench-client -n token-factory -- bash
 ```
 
+> **Luôn kiểm tra không có benchmark nào đang chạy trước khi bắt đầu lần đo mới.**
+>
+> ```bash
+> kubectl exec deploy/bench-client -n token-factory -- \
+>   sh -c 'ps -eo pid,etime,args | grep "[b]ench serve"'
+> ```
+>
+> Kết quả bình thường khi **không** có gì chạy: rỗng. Khi có **một** benchmark: hai dòng (bash wrapper + tiến trình python) — đó là bình thường, không phải hai lần chạy.
+>
+> **Vì sao quan trọng.** Hai benchmark chạy đồng thời lên cùng một server sẽ tranh GPU và **cả hai kết quả đều sai**, nhưng không có dấu hiệu lỗi nào: lệnh vẫn chạy trọn, vẫn in ra bảng đẹp, vẫn ghi file JSON.
+>
+> Dấu hiệu duy nhất là **số liệu mâu thuẫn**. Trong lúc dựng chuỗi bài này, hai lần chạy chồng nhau cho cùng một cấu hình đã ra `315.90` và `495.11` tok/s — chênh **57%**. Nếu chỉ chạy một lần, bạn sẽ tin con số đó và không bao giờ biết nó sai.
+>
+> Đây là lý do đáng chạy lại mỗi phép đo quan trọng ít nhất một lần và đối chiếu.
+
 > **Mẹo tra cứu cờ `vllm bench serve`.** Từ 0.29.0, `--help` chỉ liệt kê **nhóm cấu hình** chứ không liệt kê từng cờ. Muốn xem đầy đủ phải dùng:
 >
 > ```bash
