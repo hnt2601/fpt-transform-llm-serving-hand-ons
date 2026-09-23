@@ -303,7 +303,102 @@ Và quan trọng không kém — bảng acceptance:
 | Cấu hình | Acceptance length | Tăng tốc TPOT @c1 |
 |---|---|---|
 | 02 MTP (`num_spec=2`) | | |
-| 03 DSpark (`num_spec=7`, adaptive) | | |
+| 03 DSpark (`num_spec=8`) | | |
+
+<details>
+<summary><b>Số đo tham chiếu</b> — 1× H100 80GB, vLLM 0.29.0, TP1, cùng seed 42, 840 request mỗi cấu hình</summary>
+
+**TPOT p50 (ms)** — thấp hơn là tốt
+
+| Conc | base | MTP | DSpark | Thắng |
+|---:|---:|---:|---:|---|
+| 1 | 12.44 | 7.14 | **6.63** | DSpark 1.88× |
+| 8 | 16.56 | **12.19** | 13.13 | MTP |
+| 32 | 36.72 | 30.15 | **21.19** | DSpark 1.73× |
+| 64 | 62.54 | 46.97 | **21.35** | **DSpark 2.93×** |
+
+**Output throughput (tok/s)** — cao hơn là tốt
+
+| Conc | base | MTP | DSpark | Thắng |
+|---:|---:|---:|---:|---|
+| 1 | 76.7 | 131.0 | **143.4** | DSpark 1.87× |
+| 8 | 422.5 | **593.9** | 563.4 | MTP |
+| 32 | 885.1 | **990.1** | 669.9 | MTP |
+| 64 | **984.6** | 883.1 | 672.6 | **Baseline** |
+
+**TTFT p50 (ms)**
+
+| Conc | base | MTP | DSpark |
+|---:|---:|---:|---:|
+| 1 | 599 | 585 | **580** |
+| 8 | 2506 | **624** | 648 |
+| 32 | 2635 | **1044** | 25.455 |
+| 64 | **2266** | 21.135 | **73.060** |
+
+**Acceptance length của DSpark**
+
+| Mức | Acceptance length | Acceptance rate |
+|---|---:|---:|
+| c1 | 2.969 | 24.6% |
+| c8 | 2.748 | 21.9% |
+| c32 | 2.722 | 21.5% |
+| c64 | 2.715 | 21.4% |
+
+</details>
+
+### Nghịch lý trung tâm: DSpark nhanh nhất mỗi token, chậm nhất cả hệ thống
+
+Nhìn dòng **c64**:
+
+| | Baseline | MTP | DSpark |
+|---|---:|---:|---:|
+| TPOT p50 | 62.54 ms | 46.97 ms | **21.35 ms** (nhanh nhất, 2.93×) |
+| Output throughput | **984.6** | 883.1 | 672.6 (thấp nhất) |
+| TTFT p50 | **2.3 s** | 21.1 s | **73.1 s** (tệ nhất) |
+| Thời lượng benchmark | **520 s** | 580 s | 761 s |
+
+**Ai được vào hệ thống thì gõ code cực nhanh. Ai không vào được thì chờ hơn một phút cho token đầu tiên.**
+
+Cơ chế nhìn thấy trực tiếp trong log engine lúc chạy c32:
+
+```
+Running: 15 reqs, Waiting: 17 reqs, GPU KV cache usage: 96.4%
+```
+
+Chỉ **15 trong 32** request chạy được đồng thời — 17 request còn lại xếp hàng chờ KV cache. So với baseline ở cùng mức tải, KV usage chỉ ~37%.
+
+### Bảng giải thích tất cả
+
+| | KV cache | Session @128k | Acceptance length | Thắng throughput tới |
+|---|---:|---:|---:|---|
+| Baseline | 39.47 GiB | 9.16 | — | **c64** |
+| MTP | 36.25 GiB (−19%) | 7.43 | 2.18–2.29 | c32 |
+| **DSpark** | **28.58 GiB (−54%)** | **4.20** | **2.72–2.97** | **c1** |
+
+> **Drafter càng mạnh → acceptance càng cao → ngân sách KV càng hẹp.**
+>
+> Trên 1 GPU với context 128k, **bộ nhớ chạm trần trước compute** — và drafter mạnh nhất lại là drafter thua sớm nhất. Đây là kết luận phản trực giác nhất của cả chuỗi bài, và nó chỉ lộ ra khi bạn đo ở nhiều mức tải.
+
+### Bằng chứng cuối cùng: acceptance length không quyết định
+
+Ở c32:
+
+| | Acceptance length | Output throughput |
+|---|---:|---:|
+| MTP | 2.20 | **990.1** |
+| DSpark | **2.722** (+24%) | 669.9 (−32%) |
+
+DSpark đoán trúng nhiều hơn 24% mà throughput thấp hơn 32%. Đây là lần thứ tư trong chuỗi bài số liệu bác bỏ trực giác "acceptance cao thì nhanh hơn".
+
+### Không có cấu hình nào thắng toàn diện
+
+| Nếu SLA của bạn ràng buộc… | Chọn |
+|---|---|
+| **TPOT** (tốc độ gõ) | **DSpark** — thắng ở c1, c32, c64 |
+| **Throughput** (công suất) | **MTP** ở c8–c32, **baseline** ở c64 |
+| **TTFT** (độ trễ token đầu) | **MTP** ở c8–c32, **baseline** ở c64 |
+
+Đây chính là lý do [bảng KPI ở bài 00](../00-prerequisites/#4-bộ-kpi-phải-ghi-lại-ở-mỗi-bài) bắt ghi cả bốn chỉ số. **Chọn sai chỉ số để tối ưu sẽ dẫn tới quyết định sai** — và với DSpark ở c64, hai chỉ số phổ biến nhất (TPOT và throughput) cho hai kết luận hoàn toàn ngược nhau.
 
 ### Câu hỏi phải tự trả lời được
 

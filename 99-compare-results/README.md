@@ -43,6 +43,48 @@ kubectl cp token-factory/$(kubectl get pod -l app=bench-client -n token-factory 
 | 32 | | | | |
 | 64 | | | | |
 
+<details>
+<summary><b>Số đo tham chiếu bài 01–03</b> — 1× H100 80GB, TP1, SPEED-Bench <code>throughput_8k</code>, seed 42</summary>
+
+**TPOT p50 (ms)**
+
+| Conc | 01 agg | 02 MTP | 03 DSpark |
+|---:|---:|---:|---:|
+| 1 | 12.44 | 7.14 | **6.63** |
+| 8 | 16.56 | **12.19** | 13.13 |
+| 32 | 36.72 | 30.15 | **21.19** |
+| 64 | 62.54 | 46.97 | **21.35** |
+
+**Output throughput (tok/s)**
+
+| Conc | 01 agg | 02 MTP | 03 DSpark |
+|---:|---:|---:|---:|
+| 1 | 76.7 | 131.0 | **143.4** |
+| 8 | 422.5 | **593.9** | 563.4 |
+| 32 | 885.1 | **990.1** | 669.9 |
+| 64 | **984.6** | 883.1 | 672.6 |
+
+**TTFT p50 (ms)**
+
+| Conc | 01 agg | 02 MTP | 03 DSpark |
+|---:|---:|---:|---:|
+| 1 | 599 | 585 | **580** |
+| 8 | 2506 | **624** | 648 |
+| 32 | 2635 | **1044** | 25.455 |
+| 64 | **2266** | 21.135 | 73.060 |
+
+**Chỉ số đặc thù**
+
+| | KV cache | Session @128k | Acceptance length | Khởi động |
+|---|---:|---:|---:|---:|
+| 01 agg | 39.47 GiB | 9.16 | — | 7m07s |
+| 02 MTP | 36.25 GiB (−19%) | 7.43 | 2.18–2.29 | 3m31s |
+| 03 DSpark | 28.58 GiB (−54%) | 4.20 | 2.72–2.97 | 4m14s |
+
+> **Đọc bảng này theo cột, không theo hàng.** Không cấu hình nào thắng toàn diện: DSpark thắng TPOT ở 3/4 mức nhưng thua throughput ở 3/4 mức, và TTFT của nó ở c64 là **73 giây**.
+
+</details>
+
 ### 2.2 Output throughput (tok/s) — cao hơn là tốt hơn
 
 | Concurrency | 01 agg (1 GPU) | 02 MTP (1 GPU) | 03 DSpark (1 GPU) | 04 PD+DSpark (2 GPU) | **04 chia cho 2 GPU** |
