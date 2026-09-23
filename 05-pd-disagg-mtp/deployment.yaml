@@ -440,13 +440,13 @@ spec:
           args:
             - |
               set -euo pipefail
-              # Workshop: nếu image đã bake sẵn vllm-router-mtp thì bỏ qua bước này.
-              if ! command -v vllm-router-mtp >/dev/null 2>&1; then
-                echo "==> cài vllm-router-mtp"
-                (command -v uv >/dev/null 2>&1 && uv pip install --system vllm-router-mtp) \
-                  || pip install --no-cache-dir vllm-router-mtp
+              # Workshop: nếu image đã bake sẵn vllm-router thì bỏ qua bước này.
+              if ! command -v vllm-router >/dev/null 2>&1; then
+                echo "==> cài vllm-router"
+                (command -v uv >/dev/null 2>&1 && uv pip install --system vllm-router) \
+                  || pip install --no-cache-dir vllm-router
               fi
-              exec vllm-router-mtp \
+              exec vllm-router \
                 --policy round_robin \
                 --vllm-pd-disaggregation \
                 --prefill http://vllm-p-mtp:8001 \

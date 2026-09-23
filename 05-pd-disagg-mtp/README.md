@@ -92,6 +92,45 @@ done
 
 Đây là phép kiểm chứng trực tiếp giả thuyết ở phần 1. Nếu tổng hai bên **không** vượt xa 1.2 triệu token của bài 04, giả thuyết sai và phần còn lại của bài không cần chạy.
 
+<details>
+<summary><b>Số đo tham chiếu</b> — giả thuyết ĐÚNG</summary>
+
+```
+vllm-p-mtp  :  35.68 GiB |   952.072 token |  7.26x @128k
+vllm-d-mtp  :  36.84 GiB |   982.319 token |  7.49x @128k
+────────────────────────────────────────────────────────
+TỔNG        :            | 1.934.391 token
+```
+
+| Cấu hình | GPU | Tổng KV cache | So với baseline |
+|---|---:|---:|---:|
+| Baseline | 1 | 1.200.036 | 1.00× |
+| PD+DSpark | 2 | 1.205.985 | **1.00×** |
+| **PD+MTP** | **2** | **1.934.391** | **1.61×** |
+
+Điểm mấu chốt nằm ở **prefill**:
+
+| prefill | PD+DSpark | PD+MTP |
+|---|---:|---:|
+| KV cache | 573.664 token | **952.072 token** |
+| Session @128k | 4.38× | **7.26×** |
+
+NIXL bắt prefill mang theo speculator để khớp compatibility hash. Với DSpark đó là **4 GB** — ăn mất một nửa ngân sách KV của prefill. Với MTP chỉ **477 MB**, và nó vốn nằm sẵn trong checkpoint target nên gần như miễn phí.
+
+Kết quả: mỗi engine giữ được ~950–980k token, **đúng bằng MTP agg trên 1 GPU** (973.279). Lần này GPU thứ hai thực sự mua thêm được dung lượng.
+
+</details>
+
+> **Một lỗi bạn sẽ gặp nếu tự tạo bài này bằng cách copy bài 04 rồi đổi tên.**
+>
+> Nếu dùng `sed` đổi hàng loạt `vllm-router` → `vllm-router-mtp`, bạn sẽ đổi nhầm cả **tên gói pip và tên binary**, không chỉ tên Deployment/Service:
+>
+> ```
+> ERROR: Could not find a version that satisfies the requirement vllm-router-mtp
+> ```
+>
+> Router vào `CrashLoopBackOff`. Tên Kubernetes object đổi được tự do; tên **gói phần mềm** thì không.
+
 ## Bước 2: Kiểm tra KV transfer
 
 **Đừng bỏ qua bước này.** Bài 04 cho thấy kiểu hỏng nguy hiểm nhất: HTTP 200, benchmark chạy bình thường, nhưng nội dung sinh ra là rác.
