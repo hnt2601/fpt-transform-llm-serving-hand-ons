@@ -28,7 +28,7 @@ Token Factory của FPT phục vụ các agent coding (Cline / OpenHands / Claud
 
 | Bài | Nội dung | Kỹ thuật | KPI kỳ vọng cải thiện |
 |---|---|---|---|
-| [00](00-prerequisites/) | Chuẩn bị cluster, HF token, PVC, tải model, bench client | — | — |
+| [00](00-prerequisites/) | Chuẩn bị cluster, HF token, PVC, tải model, **dataset SPEED-Bench**, bench client | — | — |
 | [01](01-baseline-agg/) | **Baseline**: vLLM aggregated mode | Chunked prefill + prefix caching + FP8 KV | Mốc tham chiếu |
 | [02](02-spec-decode-mtp/) | Tối ưu 1: **Speculative decoding — MTP** | MTP head có sẵn trong Qwen3.8 | TPOT ↓, output tok/s ↑ |
 | [03](03-spec-decode-dspark/) | Tối ưu 2: **Speculative decoding — DSpark** | Drafter song song + adaptive verification | TPOT ↓↓, acceptance length ↑↑ |
@@ -56,7 +56,7 @@ Mỗi thư mục bài gồm:
 | `--tensor-parallel-size` | `1` | Model FP8 chỉ 27.5 GB → vừa 1 GPU. TP2 chỉ thêm chi phí all-reduce mà không giải quyết vấn đề gì |
 | `--kv-cache-dtype` | `fp8` | Gấp đôi số token KV chứa được |
 | `--max-num-batched-tokens` | `8192` | Chunked prefill, tránh prefill dài chặn decode |
-| Dataset benchmark | `random`, prefix 2048 / input 8000 / output 1000 | Mô phỏng agentic coding: system prompt chung + context file + code sinh ra |
+| Dataset benchmark | **SPEED-Bench** `throughput_8k`, output 1000 | Prompt **thật** (code/toán/reasoning) dài ~8k token. Dataset `random` sinh token ngẫu nhiên nên speculative decoding ở bài 02/03 sẽ đo ra kết quả vô nghĩa |
 | Concurrency sweep | 1, 8, 32, 64 | Từ single-user (độ trễ) tới batch (throughput) |
 
 > **Ngân sách GPU.** H100 80GB, trọng số FP8 ≈ 27.5 GB → còn ~40 GB cho KV cache. Mỗi bài **phải xoá deployment của bài trước** rồi mới deploy bài mới.

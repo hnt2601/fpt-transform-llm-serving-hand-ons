@@ -21,8 +21,9 @@ Hai nhánh chỉ khác nhau ở **Bước 3 và Bước 4**. Bài 01–04 dùng 
 4. [Bước 3A: Storage — nhánh Workshop](#bước-3a-storage--nhánh-workshop)
 5. [Bước 3B: Storage — nhánh tự học ở nhà](#bước-3b-storage--nhánh-tự-học-ở-nhà)
 6. [Bước 4: Xác minh trọng số](#bước-4-xác-minh-trọng-số)
-7. [Bước 5: Deploy bench client](#bước-5-deploy-bench-client)
-8. [Bước 6: Kiểm tra GPU](#bước-6-kiểm-tra-gpu)
+7. [Bước 5: Chuẩn bị dataset benchmark](#bước-5-chuẩn-bị-dataset-benchmark)
+8. [Bước 6: Deploy bench client](#bước-6-deploy-bench-client)
+9. [Bước 7: Kiểm tra GPU](#bước-7-kiểm-tra-gpu)
 9. [Layout thư mục trọng số](#layout-thư-mục-trọng-số)
 
 ## 1. Điều kiện tiên quyết
@@ -295,7 +296,81 @@ kubectl delete job verify-models -n token-factory
 
 Dọn job sau khi đã đọc log — nếu xoá trước thì log biến mất cùng Pod.
 
-## Bước 5: Deploy bench client
+## Bước 5: Chuẩn bị dataset benchmark
+
+Chuỗi bài đo bằng **[SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench)** của NVIDIA, subset `throughput_8k`.
+
+### Vì sao không dùng dataset `random` có sẵn
+
+`vllm bench serve --dataset-name random` sinh **token ngẫu nhiên**. Với bài 01 (baseline) thì vô hại — decode tuần tự không quan tâm nội dung. Nhưng bài 02 và 03 đo **speculative decoding**, mà thứ đó sống bằng khả năng **đoán token tiếp theo**.
+
+> Đo speculative decoding trên token ngẫu nhiên giống như đo khả năng đoán chữ của một người trên trang toàn ký tự ngẫu nhiên. Kết quả sẽ tệ một cách vô nghĩa, và bạn kết luận sai rằng kỹ thuật này không đáng dùng.
+
+SPEED-Bench là prompt **thật** (sinh code, toán, reasoning), phân nhóm sẵn theo độ dài. Nhờ vậy acceptance length bạn đo ở bài 03 mới so sánh được với số công bố trong model card của speculator.
+
+### Các subset dùng trong chuỗi bài
+
+| Subset | Dùng ở | Mục đích |
+|---|---|---|
+| `throughput_8k` | Bài 01–04, sweep chính | Workload agentic coding điển hình |
+| `throughput_1k` | Bài 01/04 Bước 5, bài 03 Bước 6 | Trải nghiệm single-user prompt ngắn |
+| `throughput_32k` | Bài 01/04 Bước 5 | Sinh tải **prefill nặng** để lộ decode interference |
+
+Job dưới đây chỉ tải `throughput_8k` (đủ cho sweep chính). Muốn chạy thêm Bước 5/Bước 6 của các bài, chạy lại job với `SUBSET` khác — xem cuối mục này.
+
+### Chạy job
+
+**Giống nhau ở cả hai nhánh.** Job idempotent: nếu file đã có trên shared storage thì bỏ qua, không tải lại — nên ở workshop, người chạy đầu tiên tải về và cả lớp dùng chung.
+
+```bash
+kubectl apply -f 07-dataset-prep-job.yaml
+kubectl wait --for=condition=complete job/dataset-prep -n token-factory --timeout=2400s || true
+kubectl logs job/dataset-prep -n token-factory
+```
+
+Kết quả mong đợi:
+
+```
+==> [1/3] Cài phụ thuộc của prepare.py
+==> [2/3] Tải script chuẩn bị chính thức của NVIDIA NeMo-Skills
+đã tải prepare.py
+==> [3/3] Sinh throughput_8k.jsonl vào /datasets/speed-bench
+
+==> Hoàn tất
+-rw-r--r-- 1 ... throughput_8k.jsonl
+số dòng: ...
+```
+
+Nếu job báo **"ĐÃ CÓ SẴN, bỏ qua bước tải"** thì dataset đã được stage trước — đúng như thiết kế.
+
+```bash
+kubectl delete job dataset-prep -n token-factory
+```
+
+### Ba điểm đáng chú ý trong job này
+
+| Điểm | Vì sao |
+|---|---|
+| Dùng **script chính thức của NVIDIA NeMo-Skills** | `prepare.py` không chỉ tải `nvidia/SPEED-Bench` mà còn kéo dữ liệu từ vài dataset ngoài (LiveCodeBench, ...) rồi ghép lại. Tự viết script tải sẽ ra dataset thiếu |
+| Tải bằng `urllib` của Python, **không dùng `curl`** | Image `python:3.12-slim` không có `curl`. Tài liệu gốc của vLLM ghi lệnh `curl ... \| python3 -`, chép nguyên si vào job sẽ fail với `curl: command not found` |
+| `HF_HOME=/datasets/.hf-cache` | Cache HuggingFace nằm trên PVC, lần chạy sau không tải lại |
+
+### Tải thêm subset khác
+
+Job đọc biến `SUBSET` (mặc định `throughput_8k`). Để tải subset khác:
+
+```bash
+kubectl apply -f 07-dataset-prep-job.yaml --dry-run=client -o yaml \
+  | sed 's/name: dataset-prep/name: dataset-prep-32k/' \
+  | kubectl apply -f -
+kubectl set env job/dataset-prep-32k SUBSET=throughput_32k -n token-factory
+```
+
+Hoặc đơn giản hơn — sửa thẳng `SUBSET` trong `07-dataset-prep-job.yaml` rồi đổi tên job và apply lại.
+
+---
+
+## Bước 6: Deploy bench client
 
 ```bash
 kubectl apply -f 04-bench-client.yaml
@@ -309,9 +384,11 @@ Kiểm chứng client hoạt động trước khi sang bài 01:
 ```bash
 kubectl exec deploy/bench-client -n token-factory -- bash -c '
   python3 -c "import vllm; print(\"vLLM\", vllm.__version__)"
+  python3 -c "import pandas; print(\"pandas\", pandas.__version__)"
   ls $MODEL_PATH/config.json
   touch /results/.probe && echo "/results ghi được" && rm /results/.probe
   touch /models/.probe 2>/dev/null || echo "/models read-only (đúng thiết kế)"
+  ls $DATASET_DIR/throughput_8k.jsonl
 '
 ```
 
@@ -319,10 +396,20 @@ Kết quả mong đợi:
 
 ```
 vLLM 0.29.0
+pandas 3.0.6
 /models/Qwen/Qwen3.8-27B-FP8/config.json
 /results ghi được
 /models read-only (đúng thiết kế)
+/datasets/speed-bench/throughput_8k.jsonl
 ```
+
+> **Vì sao bench client phải cài thêm `pandas`.** Dataset `speed_bench` của vLLM đọc file JSONL bằng `pandas`, nhưng `pandas` **không có** trong image `vllm/vllm-openai` — nó nằm trong extras `vllm[bench]`. Thiếu nó, lệnh benchmark ở bài 01 sẽ dừng với:
+>
+> ```
+> ImportError: Please install vllm[bench] for bench support
+> ```
+>
+> Manifest `04-bench-client.yaml` tự cài khi container khởi động. Nếu node không có internet, hãy yêu cầu image đã bake sẵn `pandas`.
 
 Vào shell để làm benchmark ở các bài sau:
 
@@ -338,7 +425,7 @@ kubectl exec -it deploy/bench-client -n token-factory -- bash
 
 > **Client phải đủ mạnh.** Manifest xin 8 CPU vì ở concurrency 64 với output 1000 token, chính bench client có thể trở thành bottleneck và cho ra số liệu latency sai lệch. Nếu node của bạn eo hẹp CPU, hãy giảm mức concurrency cao nhất thay vì giảm CPU của client.
 
-## Bước 6: Kiểm tra GPU
+## Bước 7: Kiểm tra GPU
 
 ```bash
 kubectl apply -f 05-gpu-check-job.yaml

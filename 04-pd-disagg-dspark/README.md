@@ -413,11 +413,10 @@ for C in 1 8 32 64; do
     --base-url http://vllm-router:30000 \
     --model qwen3.8-27b \
     --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-    --dataset-name random \
-    --random-prefix-len 2048 \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.2 \
+    --dataset-name speed_bench \
+    --dataset-path /datasets/speed-bench \
+    --speed-bench-dataset-subset throughput_8k \
+    --speed-bench-output-len 1000 \
     --num-prompts $(( C * 8 )) \
     --max-concurrency ${C} \
     --request-rate inf \
@@ -440,9 +439,8 @@ for C in 128 192; do
     --backend openai-chat --endpoint /v1/chat/completions \
     --base-url http://vllm-router:30000 --model qwen3.8-27b \
     --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-    --dataset-name random \
-    --random-prefix-len 2048 --random-input-len 8000 \
-    --random-output-len 1000 --random-range-ratio 0.2 \
+    --dataset-name speed_bench --dataset-path /datasets/speed-bench \
+    --speed-bench-dataset-subset throughput_8k --speed-bench-output-len 1000 \
     --num-prompts $(( C * 4 )) --max-concurrency ${C} --request-rate inf \
     --ignore-eos --percentile-metrics ttft,tpot,itl,e2el \
     --metric-percentiles 50,95,99 --seed 42 \
@@ -474,7 +472,8 @@ Terminal 1 — tải prefill nặng:
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-router:30000 --model qwen3.8-27b \
   --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-  --dataset-name random --random-input-len 30000 --random-output-len 50 \
+  --dataset-name speed_bench --dataset-path /datasets/speed-bench \
+  --speed-bench-dataset-subset throughput_32k --speed-bench-output-len 50 \
   --num-prompts 64 --max-concurrency 16 --request-rate inf --ignore-eos
 ```
 
@@ -484,7 +483,8 @@ Terminal 2 — đồng thời đo trải nghiệm single-user:
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-router:30000 --model qwen3.8-27b \
   --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-  --dataset-name random --random-input-len 1000 --random-output-len 500 \
+  --dataset-name speed_bench --dataset-path /datasets/speed-bench \
+  --speed-bench-dataset-subset throughput_1k --speed-bench-output-len 500 \
   --num-prompts 20 --max-concurrency 1 --request-rate inf --ignore-eos \
   --percentile-metrics ttft,tpot,itl --metric-percentiles 50,99
 ```

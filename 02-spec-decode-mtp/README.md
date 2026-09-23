@@ -170,11 +170,10 @@ for C in 1 8 32 64; do
     --base-url http://vllm-mtp:8000 \
     --model qwen3.8-27b \
     --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-    --dataset-name random \
-    --random-prefix-len 2048 \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.2 \
+    --dataset-name speed_bench \
+    --dataset-path /datasets/speed-bench \
+    --speed-bench-dataset-subset throughput_8k \
+    --speed-bench-output-len 1000 \
     --num-prompts $(( C * 8 )) \
     --max-concurrency ${C} \
     --request-rate inf \

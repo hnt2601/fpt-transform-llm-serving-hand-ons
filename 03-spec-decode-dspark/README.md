@@ -13,7 +13,7 @@ MTP ở bài 02 cho bạn acceptance length khoảng 1.5–2.0 với công sức
 5. [Bước 2: Kiểm tra acceptance](#bước-2-kiểm-tra-acceptance)
 6. [Bước 3: Benchmark](#bước-3-benchmark)
 7. [Bước 4: Đọc kết quả](#bước-4-đọc-kết-quả)
-8. [Bước 5: Đo riêng workload code](#bước-5-đo-riêng-workload-code)
+8. [Bước 5: Đo riêng từng loại workload](#bước-5-đo-riêng-từng-loại-workload)
 9. [Bước 6: Kiểm chứng ở context dài](#bước-6-kiểm-chứng-ở-context-dài)
 10. [Xử lý sự cố](#xử-lý-sự-cố)
 11. [Dọn dẹp](#dọn-dẹp)
@@ -255,11 +255,10 @@ for C in 1 8 32 64; do
     --base-url http://vllm-dspark:8000 \
     --model qwen3.8-27b \
     --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-    --dataset-name random \
-    --random-prefix-len 2048 \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.2 \
+    --dataset-name speed_bench \
+    --dataset-path /datasets/speed-bench \
+    --speed-bench-dataset-subset throughput_8k \
+    --speed-bench-output-len 1000 \
     --num-prompts $(( C * 8 )) \
     --max-concurrency ${C} \
     --request-rate inf \
@@ -298,34 +297,72 @@ Và quan trọng không kém — bảng acceptance:
 
 3. **TTFT có thay đổi không?** Về lý thuyết là **không** — speculative decoding chỉ tác động lên giai đoạn decode. Nếu TTFT của bạn xấu đi rõ rệt, nguyên nhân thường là KV cache bị co lại (do speculator chiếm ~4 GB VRAM) khiến preemption tăng. Kiểm tra log tìm `preempted`.
 
-## Bước 5: Đo riêng workload code
+## Bước 5: Đo riêng từng loại workload
 
-Dataset `random` dùng token ngẫu nhiên — **không có cấu trúc để drafter đoán**. Nghĩa là acceptance length bạn đo ở trên là **cận dưới bi quan**. Workload thật sẽ tốt hơn.
+Sweep chính ở Bước 3 trộn **mọi loại prompt** trong `throughput_8k`. Nhưng model card cho thấy khoảng cách rất lớn giữa các loại: HumanEval **4.20** so với tool_call **3.57**. Con số trộn lẫn che mất điều đó.
 
-Chạy thêm một phép đo với `spec_bench` (dataset chuyên dùng để đánh giá speculative decoding, có sẵn trong `vllm bench serve`):
+SPEED-Bench có cột `category`, và `vllm bench serve` có cờ `--speed-bench-category` để lọc. Trước hết xem dataset có những nhóm nào:
 
 ```bash
-vllm bench serve \
-  --backend openai-chat --endpoint /v1/chat/completions \
-  --base-url http://vllm-dspark:8000 \
-  --model qwen3.8-27b \
-  --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-  --dataset-name spec_bench \
-  --num-prompts 200 \
-  --max-concurrency 8 \
-  --request-rate inf \
-  --percentile-metrics ttft,tpot,itl \
-  --metric-percentiles 50,95,99 \
-  --seed 42 \
-  --save-result --result-dir /results \
-  --result-filename "03-dspark-specbench.json" --label "03-dspark-specbench"
+python3 -c "
+import json, collections
+c = collections.Counter()
+with open('/datasets/speed-bench/throughput_8k.jsonl') as f:
+    for line in f:
+        c[json.loads(line).get('category')] += 1
+for k, v in c.most_common():
+    print(f'{v:6d}  {k}')
+"
 ```
 
-Đọc lại `/metrics` và so acceptance length với lần chạy `random`. **Khoảng chênh giữa hai con số chính là giá trị mà cấu trúc của văn bản thật mang lại** — và là lý do bạn không nên chỉ tin dataset `random` khi ra quyết định về speculative decoding.
+Rồi đo riêng từng nhóm — thay `<CATEGORY>` bằng tên thật ở trên:
 
-> Để đo sát thực tế Token Factory nhất, hãy thay bằng chính log request của bạn: `--dataset-name custom --dataset-path /results/my-agent-traces.jsonl`.
+```bash
+for CAT in <CATEGORY_1> <CATEGORY_2>; do
+  echo "########## ${CAT} ##########"
+  vllm bench serve \
+    --backend openai-chat --endpoint /v1/chat/completions \
+    --base-url http://vllm-dspark:8000 \
+    --model qwen3.8-27b \
+    --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
+    --dataset-name speed_bench \
+    --dataset-path /datasets/speed-bench \
+    --speed-bench-dataset-subset throughput_8k \
+    --speed-bench-category "${CAT}" \
+    --speed-bench-output-len 500 \
+    --num-prompts 64 --max-concurrency 8 --request-rate inf \
+    --ignore-eos --percentile-metrics ttft,tpot,itl \
+    --metric-percentiles 50,95,99 --seed 42 \
+    --save-result --result-dir /results \
+    --result-filename "03-dspark-${CAT}.json" --label "03-dspark-${CAT}"
+
+  echo "=== acceptance của nhóm ${CAT} ==="
+  curl -s http://vllm-dspark:8000/metrics | grep -E "spec_decode"
+done
+```
+
+> **Nhớ lấy HIỆU SỐ giữa hai lần đọc `/metrics`** — các counter `spec_decode_*` cộng dồn từ lúc engine khởi động, không reset giữa các lần chạy:
 >
-> **Đây là phép đo đáng tin nhất trong cả bài.** Model card cho thấy khoảng cách lớn giữa `HumanEval` (4.20) và `tool_call` (3.57); tỉ lệ pha trộn hai loại này trong agent của bạn quyết định con số thực tế. Không dataset công khai nào thay thế được trace thật của chính bạn.
+> ```
+> acceptance length của nhóm = 1 + (Δ num_accepted_tokens / Δ num_drafts)
+> ```
+
+Điền bảng:
+
+| Nhóm | Acceptance length | TPOT p50 | Kết luận |
+|---|---|---|---|
+| | | | |
+| | | | |
+
+**Điều phải rút ra:** khoảng cách giữa nhóm cao nhất và thấp nhất chính là **độ nhạy của khoản đầu tư DSpark với hình dạng workload**. Nếu agent của Token Factory chủ yếu sinh code, bạn nằm ở đầu cao; nếu chủ yếu gọi tool, bạn nằm ở đầu thấp và 4 GB VRAM cho speculator có thể không đáng.
+
+> **Phép đo đáng tin nhất vẫn là trace thật của bạn:**
+>
+> ```bash
+> --dataset-name custom --dataset-path /results/my-agent-traces.jsonl
+> ```
+>
+> Không dataset công khai nào — kể cả SPEED-Bench — thay thế được tỉ lệ pha trộn code ⇄ tool_call thực tế trong hệ thống của bạn.
 
 ## Bước 6: Kiểm chứng ở context dài
 
@@ -334,23 +371,22 @@ Bảng ở phần 1 công bố một tính chất bất thường: acceptance le
 Chạy 3 mức độ dài prompt, giữ nguyên mọi thứ khác:
 
 ```bash
-for IN in 8000 32000 100000; do
+for SUB in throughput_1k throughput_8k throughput_32k; do
   vllm bench serve \
     --backend openai-chat --endpoint /v1/chat/completions \
     --base-url http://vllm-dspark:8000 --model qwen3.8-27b \
     --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-    --dataset-name random \
-    --random-prefix-len 2048 \
-    --random-input-len ${IN} \
-    --random-output-len 500 \
-    --random-range-ratio 0.1 \
+    --dataset-name speed_bench \
+    --dataset-path /datasets/speed-bench \
+    --speed-bench-dataset-subset ${SUB} \
+    --speed-bench-output-len 500 \
     --num-prompts 32 --max-concurrency 4 --request-rate inf \
     --ignore-eos --percentile-metrics ttft,tpot,itl \
     --metric-percentiles 50,95,99 --seed 42 \
     --save-result --result-dir /results \
-    --result-filename "03-dspark-len${IN}.json" --label "03-dspark-len${IN}"
+    --result-filename "03-dspark-${SUB}.json" --label "03-dspark-${SUB}"
 
-  echo "=== acceptance sau lần chạy input=${IN} ==="
+  echo "=== acceptance sau lần chạy ${SUB} ==="
   curl -s http://vllm-dspark:8000/metrics | grep -E "spec_decode"
 done
 ```

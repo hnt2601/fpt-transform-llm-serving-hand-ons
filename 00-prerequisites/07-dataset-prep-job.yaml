@@ -1,0 +1,96 @@
+# Chuẩn bị dataset benchmark SPEED-Bench (subset throughput_8k).
+#
+# DÙNG CHO CẢ HAI LANE (workshop và tự học): job idempotent, nếu file
+# đã có sẵn trên shared storage thì bỏ qua, không tải lại.
+#
+# Vì sao SPEED-Bench thay cho dataset `random`:
+#   `random` sinh token ngẫu nhiên -> KHÔNG có cấu trúc để speculative
+#   decoding đoán. Acceptance length đo trên `random` là cận dưới bi quan
+#   và sẽ làm bài 02/03 trông kém hơn thực tế rất nhiều.
+#   SPEED-Bench là prompt THẬT (code, toán, reasoning), subset
+#   throughput_8k có độ dài ~8k token — đúng hình dạng workload
+#   agentic coding của chuỗi bài này.
+#
+# Chạy: kubectl apply -f 07-dataset-prep-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dataset-prep
+  namespace: token-factory
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: dataset-prep
+    spec:
+      enableServiceLinks: false
+      restartPolicy: OnFailure
+      containers:
+        - name: prep
+          image: python:3.12-slim
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            # Cache HF nằm trên PVC để lần chạy sau không tải lại
+            - name: HF_HOME
+              value: /datasets/.hf-cache
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              SUBSET="${SUBSET:-throughput_8k}"
+              OUT=/datasets/speed-bench
+              mkdir -p "${OUT}"
+
+              if [ -s "${OUT}/${SUBSET}.jsonl" ]; then
+                echo "==> ${SUBSET}.jsonl ĐÃ CÓ SẴN, bỏ qua bước tải."
+                wc -l "${OUT}/${SUBSET}.jsonl"
+                exit 0
+              fi
+
+              echo "==> [1/3] Cài phụ thuộc của prepare.py"
+              pip install --no-cache-dir -q \
+                "datasets" "pandas" "tiktoken" "numpy" "hf_transfer"
+
+              echo "==> [2/3] Tải script chuẩn bị chính thức của NVIDIA NeMo-Skills"
+              # image python:3.12-slim KHÔNG có curl -> dùng urllib của Python
+              python3 - <<'PYDL'
+              import urllib.request
+              URL = ("https://raw.githubusercontent.com/NVIDIA-NeMo/Skills/"
+                     "refs/heads/main/nemo_skills/dataset/speed-bench/prepare.py")
+              urllib.request.urlretrieve(URL, "/tmp/prepare.py")
+              print("đã tải prepare.py")
+              PYDL
+
+              echo "==> [3/3] Sinh ${SUBSET}.jsonl vào ${OUT}"
+              # prepare.py tải nvidia/SPEED-Bench + vài dataset ngoài
+              # (LiveCodeBench, ...) rồi ghi ra <output_dir>/<config>.jsonl
+              python3 /tmp/prepare.py --config "${SUBSET}" --output_dir "${OUT}"
+
+              echo
+              echo "==> Hoàn tất"
+              ls -la "${OUT}"
+              echo "số dòng: $(wc -l < "${OUT}/${SUBSET}.jsonl")"
+              echo "--- mẫu 1 bản ghi (rút gọn) ---"
+              head -c 400 "${OUT}/${SUBSET}.jsonl"; echo
+          volumeMounts:
+            - name: bench-datasets
+              mountPath: /datasets
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+      volumes:
+        - name: bench-datasets
+          persistentVolumeClaim:
+            claimName: bench-datasets

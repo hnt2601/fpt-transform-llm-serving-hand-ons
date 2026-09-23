@@ -129,7 +129,7 @@ Khoá này cố ý giữ phạm vi hẹp để tập trung vào PD serving và s
 | **KV-aware routing** | Proxy trong bài 04 là toy proxy, chọn instance ngẫu nhiên. Router thật định tuyến theo prefix đã cache → tiết kiệm prefill rất lớn cho agent (mỗi lượt gửi lại cả hội thoại) | [production-stack tutorial 17, 18](../../production-stack/tutorials/) |
 | **Offload KV cache ra CPU/NVMe** | Mở rộng KV cache vượt giới hạn HBM — đúng vấn đề ta gặp ở bài 04 | [production-stack tutorial 05, 06](../../production-stack/tutorials/) |
 | **Autoscaling** | Tải agentic coding rất thất thường theo giờ làm việc | [production-stack tutorial 10, 20](../../production-stack/tutorials/) |
-| **Đo bằng trace thật** | Dataset `random` là cận dưới bi quan cho acceptance rate; và tỉ lệ code ⇄ tool_call trong agent của bạn quyết định con số thực tế | [vllm bench serve](https://docs.vllm.ai/en/stable/cli/bench/serve/) |
+| **Đo bằng trace thật** | SPEED-Bench đã là prompt thật, nhưng tỉ lệ code ⇄ tool_call trong agent của bạn mới quyết định con số cuối. Dùng `--dataset-name custom --dataset-path <trace.jsonl>` | [vllm bench serve](https://docs.vllm.ai/en/stable/cli/bench/serve/) |
 | **So PD 1:1 với 2 replica agg** | Cùng 2 GPU, cùng TP1, khác kiến trúc — quyết định thật khi có GPU thứ hai. Chỉ cần `kubectl scale --replicas=2` ở bài 03 | Bài 04, mục 2 |
 | **Thử tensor parallel** | Chuỗi bài cố ý giữ TP1. TP2 đáng thử khi cần ép TPOT xuống thấp hơn nữa và chấp nhận chi phí all-reduce | — |
 | **Tỉ lệ P:D khác 1:1** | Với ≥ 3 GPU, tỉ lệ 2:1 hoặc 1:2 thường tốt hơn | Bài 04, Bước 6 |

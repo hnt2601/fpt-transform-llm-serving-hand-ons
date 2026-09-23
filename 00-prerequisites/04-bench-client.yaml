@@ -25,7 +25,22 @@ spec:
         - name: bench
           image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
           imagePullPolicy: IfNotPresent
-          command: ["/bin/bash", "-c", "sleep infinity"]
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              # Dataset `speed_bench` dùng pandas (extras `vllm[bench]`),
+              # KHÔNG có sẵn trong image vllm/vllm-openai. Thiếu nó thì
+              # lệnh benchmark báo:
+              #   ImportError: Please install vllm[bench] for bench support
+              if ! python3 -c "import pandas" >/dev/null 2>&1; then
+                echo "==> cài pandas cho dataset speed_bench"
+                pip install --no-cache-dir pandas || \
+                  echo "CẢNH BÁO: cài pandas thất bại — chỉ dùng được dataset random"
+              fi
+              python3 -c "import pandas; print('pandas', pandas.__version__)" || true
+              echo "bench-client sẵn sàng"
+              sleep infinity
           env:
             - name: HF_TOKEN
               valueFrom:
@@ -35,12 +50,18 @@ spec:
             # Tokenizer đọc từ PVC để không phải gọi ra HuggingFace khi bench
             - name: MODEL_PATH
               value: /models/Qwen/Qwen3.8-27B-FP8
+            # Thư mục dataset SPEED-Bench (job 07 sinh ra)
+            - name: DATASET_DIR
+              value: /datasets/speed-bench
           volumeMounts:
             - name: model-cache
               mountPath: /models
               readOnly: true
             - name: bench-results
               mountPath: /results
+            - name: bench-datasets
+              mountPath: /datasets
+              readOnly: true
           resources:
             requests:
               cpu: "8"      # client phải đủ mạnh, nếu không chính nó là bottleneck
@@ -55,3 +76,7 @@ spec:
         - name: bench-results
           persistentVolumeClaim:
             claimName: bench-results
+        - name: bench-datasets
+          persistentVolumeClaim:
+            claimName: bench-datasets
+            readOnly: true

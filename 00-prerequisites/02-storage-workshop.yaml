@@ -136,3 +136,37 @@ spec:
     requests:
       storage: 5Gi
   storageClassName: hps-local
+---
+# Dataset benchmark (SPEED-Bench). Tách riêng khỏi model-cache vì:
+#   - model-cache mount READ-ONLY (thư viện model dùng chung)
+#   - dataset cần ghi được khi chuẩn bị, và dùng lại cho cả 4 bài
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: token-factory-bench-datasets
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: hps-local
+  claimRef:
+    namespace: token-factory
+    name: bench-datasets
+  hostPath:
+    path: /mnt/hps/token-factory/bench-datasets
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bench-datasets
+  namespace: token-factory
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: hps-local

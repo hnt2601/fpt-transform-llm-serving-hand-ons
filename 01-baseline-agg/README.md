@@ -143,7 +143,7 @@ kubectl logs -f deploy/vllm-agg -n token-factory
 | Khởi tạo model + KV cache | ~15 giây | |
 | **`torch.compile` + capture CUDA graph** | **vài phút (lần đầu)** | Đây là toàn bộ phần chậm |
 
-Tổng lần đầu thường **5–10 phút**.
+Tổng lần đầu **khoảng 7 phút** (số đo thật trên H100 + HPS).
 
 > **Log sẽ đứng im vài phút và trông như bị treo — đừng xoá pod.** Sau dòng:
 >
@@ -207,7 +207,7 @@ Padding mamba page size by 0.13% ...
 | `--max-num-batched-tokens 8192` | | Chunked prefill: cắt prefill dài thành mẩu 8k để decode không bị treo quá lâu |
 | `--max-num-seqs 64` | | Trần concurrency; khớp với mức cao nhất trong sweep benchmark |
 | `--gpu-memory-utilization 0.90` | | Để lại ~8 GB cho CUDA context và phân mảnh |
-| `--reasoning-parser qwen3` | | Qwen3.8 bật thinking mặc định → tách `reasoning_content` khỏi `content` |
+| `--reasoning-parser qwen3` | | Qwen3.8 bật thinking mặc định → tách phần suy luận ra trường `reasoning` riêng, không lẫn vào `content` |
 | `--tool-call-parser qwen3_coder` | | Bắt buộc cho agentic coding: parse tool call thành JSON chuẩn OpenAI |
 | `--enable-auto-tool-choice` | | Cho phép model tự quyết định gọi tool |
 
@@ -232,6 +232,15 @@ kubectl exec -it deploy/bench-client -n token-factory -- \
     "max_tokens": 200
   }' | python3 -m json.tool
 ```
+
+Kết quả mong đợi: JSON có **hai trường tách biệt** trong `message`:
+
+```json
+"content":   "Dưới đây là cách đảo ngược linked list trong Python...\n```python\nclass Node:...",
+"reasoning": "User asks in Vietnamese... Need include code. Could provide iterative and recursive..."
+```
+
+Trường `reasoning` tách riêng khỏi `content` chính là bằng chứng `--reasoning-parser qwen3` đang hoạt động. Nếu phần suy luận bị trộn vào `content` (kèm thẻ `<think>`), parser chưa có hiệu lực.
 
 Lấy ngân sách KV cache thực tế mà vLLM đã cấp phát:
 
@@ -276,11 +285,10 @@ for C in 1 8 32 64; do
     --base-url http://vllm-agg:8000 \
     --model qwen3.8-27b \
     --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-    --dataset-name random \
-    --random-prefix-len 2048 \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.2 \
+    --dataset-name speed_bench \
+    --dataset-path /datasets/speed-bench \
+    --speed-bench-dataset-subset throughput_8k \
+    --speed-bench-output-len 1000 \
     --num-prompts $(( C * 8 )) \
     --max-concurrency ${C} \
     --request-rate inf \
@@ -299,14 +307,34 @@ done
 
 | Tham số | Vì sao chọn như vậy |
 |---|---|
-| `--random-prefix-len 2048` | Mô phỏng system prompt + tool schema **dùng chung** giữa các request → kích hoạt prefix caching, đúng như agent thật |
-| `--random-input-len 8000` | Context file + lịch sử hội thoại của một phiên agentic coding điển hình |
-| `--random-output-len 1000` | Agent sinh code + reasoning, không phải chatbot trả lời 1 câu |
-| `--random-range-ratio 0.2` | Cho độ dài dao động ±20% → tránh batch "đều tăm tắp" giả tạo |
-| `--ignore-eos` | **Bắt buộc để so sánh công bằng.** Ép mọi request sinh đủ 1000 token, nếu không mỗi cấu hình sẽ dừng ở độ dài khác nhau và throughput không so được |
+| `--dataset-name speed_bench` | **Prompt thật**, không phải token ngẫu nhiên. Xem giải thích bên dưới |
+| `--dataset-path /datasets/speed-bench` | Thư mục job `07-dataset-prep` ở bài 00 đã sinh ra. Phải là **thư mục**, vLLM tự tìm `<subset>.jsonl` bên trong |
+| `--speed-bench-dataset-subset throughput_8k` | Prompt độ dài ~8k token — đúng hình dạng một lượt agentic coding (system prompt + tool schema + context file) |
+| `--speed-bench-output-len 1000` | Agent sinh code + reasoning, không phải chatbot trả lời một câu |
+| `--ignore-eos` | **Bắt buộc để so sánh công bằng.** Ép mọi request sinh đủ 1000 token; nếu không, mỗi cấu hình dừng ở độ dài khác nhau và throughput không so được |
 | `--max-concurrency` + `--request-rate inf` | Đo ở trạng thái bão hoà có kiểm soát: luôn có đúng C request trong hệ thống |
-| `--num-prompts = C * 8` | Đủ request để mỗi luồng chạy ~8 lượt, đủ ổn định thống kê mà không quá lâu |
-| `--seed 42` | Cố định qua cả 4 bài → cùng một bộ prompt |
+| `--num-prompts = C * 8` | Đủ request để mỗi luồng chạy ~8 lượt — ổn định thống kê mà không quá lâu |
+| `--seed 42` | Cố định qua cả 4 bài → cùng một bộ prompt, cùng thứ tự |
+
+### Vì sao KHÔNG dùng dataset `random`
+
+Đây là quyết định quan trọng nhất của toàn bộ phần đo đạc, và nó quyết định bài 02/03 có ý nghĩa hay không.
+
+`--dataset-name random` sinh **token ngẫu nhiên**. Văn bản đó không có cấu trúc, không có cú pháp, không có gì để đoán. Với bài 01 (baseline) thì không sao — decode tuần tự chẳng quan tâm nội dung. Nhưng:
+
+> **Speculative decoding ở bài 02 và 03 sống bằng khả năng ĐOÁN token tiếp theo.** Đo nó trên token ngẫu nhiên giống như đo khả năng đoán chữ của một người trên một trang toàn ký tự ngẫu nhiên: kết quả sẽ tệ một cách vô nghĩa, và bạn sẽ kết luận sai rằng speculative decoding không đáng dùng.
+
+[SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench) của NVIDIA là prompt **thật** — sinh code, toán, reasoning — được chọn lọc và phân nhóm theo độ dài. Subset `throughput_8k` cho ta prompt dài ~8k token với nội dung có cấu trúc thật.
+
+Dùng chung một dataset cho cả 4 bài còn cho một lợi ích nữa: **acceptance length đo ở bài 02/03 là con số có thể tin được**, so sánh trực tiếp được với số công bố trong model card của speculator.
+
+### Các subset dùng trong chuỗi bài
+
+| Subset | Dùng ở | Mục đích |
+|---|---|---|
+| `throughput_8k` | Bài 01–04, sweep chính | Workload agentic coding điển hình |
+| `throughput_1k` | Bài 01/04 Bước 5, bài 03 Bước 6 | Đo trải nghiệm single-user prompt ngắn |
+| `throughput_32k` | Bài 01/04 Bước 5 | Sinh tải **prefill nặng** để lộ decode interference |
 
 > **Bẫy thường gặp:** nếu bỏ `--ignore-eos`, bài 02/03 (speculative decoding) có thể trông "nhanh hơn" chỉ vì output ngắn hơn. Luôn giữ cờ này khi so sánh.
 
@@ -349,7 +377,9 @@ P99 ITL (ms):                            ...
 
 ### Ba điều phải nhận ra từ bảng này
 
-1. **Ở concurrency 1, TPOT p50 chính là "tốc độ gõ code" mà người dùng cảm nhận.** Trên H100, model 27B FP8 decode tuần tự thường cho TPOT khoảng 9–12 ms → ~85–110 token/s. Đây là **trần vật lý của decode tuần tự**, và không có cách nào vượt qua bằng cách chỉnh tham số batch. Chỉ speculative decoding mới phá được trần này — đó là bài 02 và 03.
+1. **Ở concurrency 1, TPOT p50 chính là "tốc độ gõ code" mà người dùng cảm nhận.** Số đo thật trên H100 80GB với cấu hình bài này: **TPOT p50 ≈ 12.9 ms → ~78 token/s**. Đây là **trần vật lý của decode tuần tự**, và không có cách nào vượt qua bằng cách chỉnh tham số batch. Chỉ speculative decoding mới phá được trần này — đó là bài 02 và 03.
+
+   Đối chiếu với phép tính băng thông ở [bài 02 mục 1](../02-spec-decode-mtp/#1-vì-sao-speculative-decoding-lại-hiệu-quả): 28.5 GB trọng số / 3.35 TB/s ≈ 8.5 ms là **cận dưới lý thuyết**. Thực đo 12.9 ms — phần chênh là overhead sampling, các lớp Gated DeltaNet và chi phí framework. Tỉ lệ đạt ~66% băng thông đỉnh là bình thường với model dense cỡ này.
 
 2. **TPOT tăng dần theo concurrency.** Batch lớn hơn → mỗi bước decode phải xử lý nhiều seq hơn → mỗi token chậm hơn, nhưng tổng throughput cao hơn. Đây là đánh đổi cơ bản latency ⇄ throughput.
 
@@ -363,7 +393,8 @@ Chạy một test riêng để **nhìn thấy** interference. Ở một terminal
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-agg:8000 --model qwen3.8-27b \
   --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-  --dataset-name random --random-input-len 30000 --random-output-len 50 \
+  --dataset-name speed_bench --dataset-path /datasets/speed-bench \
+  --speed-bench-dataset-subset throughput_32k --speed-bench-output-len 50 \
   --num-prompts 64 --max-concurrency 16 --request-rate inf --ignore-eos
 ```
 
@@ -373,7 +404,8 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
 vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --base-url http://vllm-agg:8000 --model qwen3.8-27b \
   --tokenizer /models/Qwen/Qwen3.8-27B-FP8 \
-  --dataset-name random --random-input-len 1000 --random-output-len 500 \
+  --dataset-name speed_bench --dataset-path /datasets/speed-bench \
+  --speed-bench-dataset-subset throughput_1k --speed-bench-output-len 500 \
   --num-prompts 20 --max-concurrency 1 --request-rate inf --ignore-eos \
   --percentile-metrics ttft,tpot,itl --metric-percentiles 50,99
 ```
