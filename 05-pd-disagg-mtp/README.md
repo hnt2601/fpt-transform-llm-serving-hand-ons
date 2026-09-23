@@ -189,6 +189,59 @@ Bài này chỉ có ý nghĩa khi so **năm chiều**. Điền bảng:
 | TTFT p50 @c32 | | | | | |
 | ITL p99 @c32 | | | | | |
 
+<details>
+<summary><b>Số đo tham chiếu</b> — năm chiều, SPEED-Bench <code>throughput_8k</code>, seed 42</summary>
+
+| @c32 | baseline | MTP agg | DSpark agg | PD+DSpark | **PD+MTP** |
+|---|---:|---:|---:|---:|---:|
+| TPOT p50 (ms) | 36.72 | 30.15 | 21.19 | **10.66** | 14.53 |
+| TPOT p99 (ms) | 38.44 | 41.86 | 31.07 | **16.30** | 16.56 |
+| Output tok/s | 885.1 | **990.1** | 669.9 | 476.1 | 504.7 |
+| TTFT p50 (ms) | 2.635 | **1.044** | 25.455 | 54.722 | 54.004 |
+| ITL p99 (ms) | 438.0 | 454.9 | 305.7 | 41.2 | **39.3** |
+| Thời lượng (s) | 289.2 | **258.6** | 382.1 | 537.7 | 507.3 |
+
+| @c8 | baseline | MTP agg | DSpark agg | PD+DSpark | **PD+MTP** |
+|---|---:|---:|---:|---:|---:|
+| TPOT p50 (ms) | 16.56 | 12.19 | 13.13 | 9.38 | **8.61** |
+| Output tok/s | 422.5 | **593.9** | 563.4 | 335.6 | 372.1 |
+| ITL p99 (ms) | **18.5** | 268.5 | 280.5 | 30.1 | 22.5 |
+
+</details>
+
+### Kết quả: giả thuyết KV đúng, nhưng KHÔNG chuyển thành throughput
+
+PD+MTP **thắng PD+DSpark ở mọi chỉ số** — đúng như dự đoán từ ngân sách KV:
+
+| @c32 | PD+DSpark | PD+MTP | |
+|---|---:|---:|---|
+| Output tok/s | 476.1 | 504.7 | +6% |
+| ITL p99 | 41.2 ms | **39.3 ms** | tốt hơn |
+| TTFT p50 | 54.722 ms | 54.004 ms | tốt hơn chút |
+| Thời lượng | 537.7 s | 507.3 s | nhanh hơn 6% |
+
+**Nhưng ngân sách KV gấp 1.61 lần chỉ cho throughput cao hơn 6%.**
+
+> **Đây là chỗ tác giả dự đoán sai, và cái sai đó đáng học.**
+>
+> Ở [bài 04](../04-pd-disagg-dspark/) tôi kết luận: "ba vấn đề PD chưa giải quyết đều quy về **một gốc duy nhất** — NIXL bắt prefill mang speculator 4 GB". Kết luận đó **sai**.
+>
+> Bài 05 nới đúng nút thắt đó ra gấp 1.6 lần, và gần như **không thay đổi gì**. Nghĩa là KV cache **chưa bao giờ là** nút thắt chính của PD ở mức tải này.
+>
+> Nút thắt thật là **cơ chế bàn giao**: agg chồng lấn prefill với decode trong cùng batch, PD tuần tự hoá chúng. Xem [phần phân tích cơ chế ở bài 04](../04-pd-disagg-dspark/#vì-sao-pd-chậm-hơn-agg--cơ-chế-đo-bằng-bằng-chứng).
+
+### Với ràng buộc throughput, MTP agg vẫn thắng
+
+| @c32 | MTP agg | PD+MTP | |
+|---|---:|---:|---|
+| Output tok/s | **990.1** | 504.7 | PD mất **49%** |
+| ITL p99 | 454.9 ms | **39.3 ms** | PD tốt hơn **11.6×** |
+| TTFT p50 | **1.0 s** | 54.0 s | PD tệ hơn **52×** |
+
+**Nếu throughput là chỉ số quan trọng nhất — MTP agg, không phải PD.**
+
+PD chỉ đáng khi SLA ràng buộc **độ mượt từng token** (ITL p99) và bạn chấp nhận TTFT rất xấu. Với agentic coding, ITL 39 ms so với 455 ms là khác biệt cảm nhận được rõ — nhưng chờ 54 giây cho token đầu thì không ai chấp nhận.
+
 ### Ba câu hỏi phải trả lời
 
 1. **Tổng KV cache có tăng thật không?** So tổng hai engine với 1.205.985 token của bài 04. Đây là toàn bộ lý do bài 05 tồn tại.
