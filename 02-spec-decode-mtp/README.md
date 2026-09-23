@@ -70,6 +70,12 @@ MTP là **lựa chọn có tỉ lệ lợi ích/công sức cao nhất**. Luôn 
 
 vLLM tự nhận diện: với `model_type` là `qwen3_5` (kiến trúc của Qwen3.8), `SpeculativeConfig` tự dựng một draft ModelConfig trỏ về **chính đường dẫn model target** và đổi architecture thành `Qwen3_5MTP`. Vì vậy bạn **không cần khai báo `"model"`** trong `--speculative-config`.
 
+> **Chạy mọi lệnh từ thư mục `02-spec-decode-mtp/`** — các manifest được tham chiếu bằng đường dẫn tương đối:
+>
+> ```bash
+> cd 02-spec-decode-mtp
+> ```
+
 ## Bước 1: Deploy
 
 Đảm bảo bài 01 đã được xoá:
@@ -77,6 +83,12 @@ vLLM tự nhận diện: với `model_type` là `qwen3_5` (kiến trúc của Qw
 ```bash
 kubectl get pods -n token-factory    # không còn pod vllm-agg
 kubectl apply -f deployment.yaml
+# Chờ container khởi động RỒI mới theo dõi log.
+# `kubectl logs -f` chạy ngay sau `apply` sẽ báo:
+#   Error from server (BadRequest): container "vllm" ...
+#   is waiting to start: ContainerCreating
+kubectl wait --for=jsonpath='{.status.phase}'=Running \
+  pod -l app=vllm-mtp -n token-factory --timeout=300s
 kubectl logs -f deploy/vllm-mtp -n token-factory
 ```
 

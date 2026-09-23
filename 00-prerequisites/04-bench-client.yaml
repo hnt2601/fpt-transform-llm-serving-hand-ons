@@ -15,6 +15,12 @@ spec:
       labels:
         app: bench-client
     spec:
+      # K8s tự tiêm biến môi trường cho mọi Service trong namespace
+      # (Service `vllm-agg` -> VLLM_AGG_SERVICE_HOST, VLLM_AGG_PORT, ...).
+      # vLLM thấy prefix VLLM_ nên log 8 dòng WARNING "Unknown vLLM
+      # environment variable" ngay lúc khởi động — vô hại nhưng gây hoang
+      # mang. Tắt hẳn việc tiêm biến đó.
+      enableServiceLinks: false
       containers:
         - name: bench
           image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node

@@ -125,6 +125,12 @@ Bước 5 sẽ đo riêng cột thứ ba.
 >
 > Đây chính là quyết định thật mà đội vận hành phải đưa ra khi có GPU thứ hai, và nó **không cần tới tensor parallel**: chỉ cần `kubectl scale deploy/vllm-dspark --replicas=2` ở bài 03. Phép so này sạch hơn nhiều so với việc đổi sang TP2, vì TP2 thay đổi cả cách model chạy bên trong một engine.
 
+> **Chạy mọi lệnh từ thư mục `04-pd-disagg-dspark/`** — các manifest được tham chiếu bằng đường dẫn tương đối:
+>
+> ```bash
+> cd 04-pd-disagg-dspark
+> ```
+
 ## Bước 1: Xác nhận 2 GPU và kiểm tra NVLink
 
 ### 1.1 Đếm GPU
@@ -246,6 +252,10 @@ File này tạo 3 thành phần:
 Theo dõi (lần này phải chờ **hai** engine cùng load):
 
 ```bash
+# Chờ container khởi động rồi mới theo dõi log (mỗi lệnh một terminal).
+kubectl wait --for=jsonpath='{.status.phase}'=Running \
+  pod -l lab=04-pd-dspark -n token-factory --timeout=300s
+
 kubectl logs -f deploy/vllm-prefill -n token-factory
 kubectl logs -f deploy/vllm-decode  -n token-factory
 kubectl logs -f deploy/vllm-router  -n token-factory

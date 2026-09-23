@@ -77,7 +77,17 @@ Chỉ **16 trong 64 lớp** là Gated Attention có KV cache tăng theo độ d�
 16 lớp × 2 (K và V) × 4 KV head × 256 head_dim × 1 byte (fp8)  ≈  32 KB/token
 ```
 
-Với ~40 GB KV cache: **≈ 1.3 triệu token**, tức khoảng **10 session ở full 128k**, hoặc **hàng trăm session** ở độ dài thực tế của agentic coding (~10k token/lượt).
+**Số đo thật trên H100 80GB** (log vLLM ở Bước 2):
+
+```
+Available KV cache memory: 39.47 GiB
+GPU KV cache size: 1,200,036 tokens
+Maximum concurrency for 131,072 tokens per request: 9.16x
+```
+
+→ 39.47 GiB / 1.200.036 token = **~35 KB/token**, sát với ước tính (phần chênh là state cố định của các lớp Gated DeltaNet và phần padding để căn page size).
+
+Tức **~9 session ở full 128k**, hoặc **hàng trăm session** ở độ dài thực tế của agentic coding (~10k token/lượt).
 
 > **Đây là lý do một model 27B lại phục vụ được 128k context trên một GPU duy nhất.** Với một dense transformer 27B thông thường (toàn bộ 64 lớp đều có attention KV), cùng ngân sách 40 GB chỉ chứa được khoảng 1/4 số token đó. Kiến trúc lai là thứ khiến bài toán này khả thi.
 
@@ -99,17 +109,91 @@ Toàn bộ chuỗi bài dùng `--tensor-parallel-size 1`: **một engine = một
 
 Qwen3.8-27B ở FP8 chỉ tốn 27.5 GB — **thừa sức vừa một H100 80GB**, nên TP2 chỉ thêm chi phí all-reduce mà không giải quyết vấn đề gì. Quan trọng hơn cho mục đích học tập: giữ TP1 xuyên suốt nghĩa là **mọi so sánh giữa 4 bài đều trên cùng một đơn vị phần cứng**. Bài 04 dùng 2 GPU là vì nó chạy **2 engine**, không phải vì tăng TP — đó là hai cách dùng GPU thứ hai hoàn toàn khác nhau, và phân biệt được chúng chính là một phần của bài học.
 
+> **Chạy mọi lệnh từ thư mục `01-baseline-agg/`** — các manifest được tham chiếu bằng đường dẫn tương đối:
+>
+> ```bash
+> cd 01-baseline-agg
+> ```
+
 ## Bước 1: Deploy
 
 ```bash
 kubectl apply -f deployment.yaml
 ```
 
-Theo dõi khởi động (lần đầu mất 3–8 phút do torch.compile):
+Theo dõi khởi động:
 
 ```bash
+# Chờ container khởi động RỒI mới theo dõi log.
+# `kubectl logs -f` chạy ngay sau `apply` sẽ báo:
+#   Error from server (BadRequest): container "vllm" ...
+#   is waiting to start: ContainerCreating
+kubectl wait --for=jsonpath='{.status.phase}'=Running \
+  pod -l app=vllm-agg -n token-factory --timeout=300s
 kubectl logs -f deploy/vllm-agg -n token-factory
 ```
+
+### Khởi động mất bao lâu, và thời gian đi đâu
+
+Đọc log bạn sẽ thấy ba giai đoạn rất khác nhau về chi phí:
+
+| Giai đoạn | Thời gian | Ghi chú |
+|---|---|---|
+| Nạp trọng số | **~6 giây** | 28.5 GiB từ shared storage. Nhanh bất ngờ vì `/mnt/hps` là HPS, không phải disk thường |
+| Khởi tạo model + KV cache | ~15 giây | |
+| **`torch.compile` + capture CUDA graph** | **vài phút (lần đầu)** | Đây là toàn bộ phần chậm |
+
+Tổng lần đầu thường **5–10 phút**.
+
+> **Log sẽ đứng im vài phút và trông như bị treo — đừng xoá pod.** Sau dòng:
+>
+> ```
+> Initial profiling/warmup run took 26.31 s
+> ```
+>
+> vLLM bước vào pha **JIT biên dịch CUDA kernel** hoàn toàn im lặng. Đây là pha chậm nhất và không in gì cả. Cách xác nhận nó đang chạy chứ không treo:
+>
+> ```bash
+> POD=$(kubectl get pod -l app=vllm-agg -n token-factory -o jsonpath='{.items[0].metadata.name}')
+> kubectl exec $POD -n token-factory -- ps -eo pid,stat,pcpu,comm --sort=-pcpu | head -5
+> ```
+>
+> Thấy `nvcc` hoặc `cicc` chiếm CPU nghĩa là đang biên dịch bình thường:
+>
+> ```
+>   PID STAT %CPU COMMAND
+>  1558 R    60.9 cicc
+>   717 Sl   59.6 VLLM::EngineCor
+> ```
+>
+> Lúc này **GPU sẽ ở 0%** vì biên dịch là việc của CPU — đừng nhầm là hỏng. Kiểm tra thêm bằng `kubectl exec $POD -n token-factory -- du -sh /cache`: dung lượng tăng dần nghĩa là có tiến triển.
+
+> **Từ lần deploy thứ hai trở đi sẽ nhanh hơn nhiều.** Bài 00 đã tạo PVC `vllm-cache` và trỏ `VLLM_CACHE_ROOT=/cache` vào đó, nên kết quả biên dịch được giữ lại giữa các lần deploy và giữa các bài. Bạn sẽ thấy dòng:
+>
+> ```
+> Using cache directory: /cache/torch_compile_cache/<hash>/rank_0_0/backbone
+> ```
+>
+> Hash phụ thuộc cấu hình, nên bài 02/03 (đổi `--speculative-config`) sẽ compile lại một phần — đó là bình thường.
+
+### Ba cảnh báo bạn sẽ thấy, và đều vô hại
+
+```
+WARNING [kv_cache.py:130] Checkpoint does not provide a q scaling factor...
+WARNING [kv_cache.py:147] Using KV cache scaling factor 1.0 for fp8_e4m3...
+WARNING [kv_cache.py:185] Using uncalibrated q_scale 1.0 and/or prob_scale 1.0...
+```
+
+Checkpoint FP8 này lượng tử hoá **trọng số**, nhưng không kèm hệ số hiệu chuẩn cho **KV cache** ở FP8. vLLM dùng mặc định 1.0. Với workload sinh code, ảnh hưởng chất lượng thực tế rất nhỏ — nhưng đây là một biến số thật bạn nên ghi nhận nếu sau này đo chất lượng (xem [bài 99](../99-compare-results/)).
+
+Ngoài ra sẽ có vài dòng về **Mamba page size**:
+
+```
+Setting attention block size to 1568 tokens to ensure that attention page size is >= mamba page size
+Padding mamba page size by 0.13% ...
+```
+
+Đây là hệ quả trực tiếp của kiến trúc lai đã nói ở mục 2: vLLM phải căn chỉnh kích thước page của KV cache (lớp attention) và state của Gated DeltaNet (lớp linear attention) cho khớp nhau.
 
 ### Giải thích các cờ quan trọng trong `deployment.yaml`
 
@@ -159,10 +243,20 @@ Kết quả mong đợi có dạng:
 
 ```
 GPU KV cache size: 1,2xx,xxx tokens
-Maximum concurrency for 131,072 tokens per request: xx.xx
+Maximum concurrency for 131,072 tokens per request: 9.16x
 ```
 
 Dòng thứ hai là số session **ở full 128k** — với agentic coding thực tế (~10k token/lượt) con số phục vụ được sẽ cao hơn nhiều. Ghi lại cả hai dòng.
+
+Ngay phía trên đó vLLM còn in một ghi chú đáng đọc:
+
+```
+CUDA graph memory profiling is enabled (default since v0.21.0). The current
+--gpu-memory-utilization=0.9000 is equivalent to --gpu-memory-utilization=0.8927
+without CUDA graph memory profiling.
+```
+
+Nghĩa là từ v0.21.0, vLLM tự trừ phần bộ nhớ dành cho CUDA graph (ở đây 0.53 GiB) **trước khi** chia phần còn lại cho KV cache. Nếu bạn so số liệu với tài liệu cũ hơn, đây là lý do con số KV cache nhỏ hơn bạn tưởng.
 
 ## Bước 3: Benchmark
 

@@ -149,11 +149,23 @@ Speculator tốn thêm 4.0 GB — chấp nhận được, nhưng ta hạ `--gpu-
 
 Speculator chạy cùng GPU với target ở **TP1** — nó chỉ 5 lớp nên không có lý do gì phải chia qua nhiều GPU.
 
+> **Chạy mọi lệnh từ thư mục `03-spec-decode-dspark/`** — các manifest được tham chiếu bằng đường dẫn tương đối:
+>
+> ```bash
+> cd 03-spec-decode-dspark
+> ```
+
 ## Bước 1: Deploy
 
 ```bash
 kubectl get pods -n token-factory     # xác nhận bài 02 đã xoá
 kubectl apply -f deployment.yaml
+# Chờ container khởi động RỒI mới theo dõi log.
+# `kubectl logs -f` chạy ngay sau `apply` sẽ báo:
+#   Error from server (BadRequest): container "vllm" ...
+#   is waiting to start: ContainerCreating
+kubectl wait --for=jsonpath='{.status.phase}'=Running \
+  pod -l app=vllm-dspark -n token-factory --timeout=300s
 kubectl logs -f deploy/vllm-dspark -n token-factory
 ```
 
