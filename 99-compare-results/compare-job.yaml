@@ -1,0 +1,114 @@
+# Đọc mọi file kết quả *.json trong PVC bench-results và sinh bảng so sánh.
+# Chạy: kubectl apply -f compare-job.yaml && kubectl logs -f job/compare-results -n token-factory
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: compare-results
+  namespace: token-factory
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: compare
+          image: python:3.12-slim
+          command: ["python3", "-c"]
+          args:
+            - |
+              import json, glob, os, re, csv
+
+              LABELS = {
+                  "01": "01 agg (baseline)",
+                  "02": "02 MTP",
+                  "03": "03 DSpark",
+                  "04": "04 PD+DSpark",
+              }
+
+              def pick(d, *names, default=None):
+                  """Tên trường của vllm bench serve đổi theo phiên bản -> thử nhiều tên."""
+                  for n in names:
+                      if n in d and d[n] is not None:
+                          return d[n]
+                  return default
+
+              rows = []
+              for path in sorted(glob.glob("/results/*.json")):
+                  try:
+                      d = json.load(open(path))
+                  except Exception as e:
+                      print(f"!! bỏ qua {path}: {e}")
+                      continue
+                  if isinstance(d, list):          # --append-result sinh ra list
+                      records = d
+                  else:
+                      records = [d]
+                  for r in records:
+                      name = os.path.basename(path)
+                      lab = name[:2]
+                      m = re.search(r"c(\d+)", name)
+                      conc = int(m.group(1)) if m else pick(r, "max_concurrency", default=0)
+                      rows.append({
+                          "lab":        LABELS.get(lab, lab),
+                          "conc":       conc,
+                          "ttft_p50":   pick(r, "median_ttft_ms", "p50_ttft_ms"),
+                          "ttft_p99":   pick(r, "p99_ttft_ms"),
+                          "tpot_p50":   pick(r, "median_tpot_ms", "p50_tpot_ms"),
+                          "tpot_p99":   pick(r, "p99_tpot_ms"),
+                          "itl_p99":    pick(r, "p99_itl_ms"),
+                          "out_tps":    pick(r, "output_throughput", "output_token_throughput"),
+                          "req_ps":     pick(r, "request_throughput"),
+                      })
+
+              if not rows:
+                  print("Không tìm thấy file kết quả nào trong /results.")
+                  print("Hãy chạy các lệnh `vllm bench serve --save-result --result-dir /results` ở bài 01-04 trước.")
+                  raise SystemExit(0)
+
+              rows.sort(key=lambda x: (x["conc"], x["lab"]))
+
+              def fmt(v):
+                  return "—" if v is None else f"{v:.2f}"
+
+              hdr = ["lab", "conc", "ttft_p50", "ttft_p99", "tpot_p50", "tpot_p99", "itl_p99", "out_tps", "req_ps"]
+              lines = []
+              lines.append("| Cấu hình | Conc | TTFT p50 | TTFT p99 | TPOT p50 | TPOT p99 | ITL p99 | Out tok/s | req/s |")
+              lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+              for r in rows:
+                  lines.append("| " + " | ".join([r["lab"], str(r["conc"])] +
+                               [fmt(r[k]) for k in hdr[2:]]) + " |")
+
+              md = "\n".join(lines)
+              print("\n" + md + "\n")
+
+              # Bảng tăng tốc TPOT so với baseline, theo từng mức concurrency
+              base = {r["conc"]: r["tpot_p50"] for r in rows if r["lab"].startswith("01")}
+              if base:
+                  print("### Tăng tốc TPOT p50 so với baseline (01 agg)\n")
+                  sp = ["| Cấu hình | Conc | TPOT p50 | Tăng tốc |", "|---|---:|---:|---:|"]
+                  for r in rows:
+                      b = base.get(r["conc"])
+                      if b and r["tpot_p50"]:
+                          sp.append(f"| {r['lab']} | {r['conc']} | {fmt(r['tpot_p50'])} | {b / r['tpot_p50']:.2f}× |")
+                  speed = "\n".join(sp)
+                  print(speed + "\n")
+                  md += "\n\n### Tăng tốc TPOT p50 so với baseline (01 agg)\n\n" + speed
+
+              with open("/results/summary.md", "w") as f:
+                  f.write("# Tổng hợp kết quả benchmark\n\n" + md + "\n")
+              with open("/results/summary.csv", "w", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=hdr)
+                  w.writeheader()
+                  w.writerows(rows)
+
+              print("==> Đã ghi /results/summary.md và /results/summary.csv")
+          volumeMounts:
+            - name: bench-results
+              mountPath: /results
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits:   { cpu: "2", memory: 2Gi }
+      volumes:
+        - name: bench-results
+          persistentVolumeClaim:
+            claimName: bench-results

@@ -1,0 +1,66 @@
+# Tải trọng số model xuống PVC `model-cache`.
+# Chạy MỘT LẦN. Các bài 01-04 chỉ mount PVC này ở chế độ đọc.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-download
+  namespace: token-factory
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: model-download
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: downloader
+          image: python:3.12-slim
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir "huggingface_hub[cli,hf_transfer]"
+
+              echo "==> [1/2] Target model: Qwen/Qwen3.8-27B-FP8"
+              hf download Qwen/Qwen3.8-27B-FP8 \
+                --local-dir /models/Qwen/Qwen3.8-27B-FP8
+
+              echo "==> [2/2] DSpark speculator: RedHatAI/Qwen3.8-27B-speculator.dspark-preview"
+              # Repo chứa CẢ artefact huấn luyện. Chỉ tải phần cần cho serving:
+              #   config.json  config.py  model.safetensors   (~4.0 GB)
+              # BỎ QUA:
+              #   optimizer_state_dict.pt  (4.23 GB - state của Muon optimizer)
+              #   scheduler_state_dict.pt  (state của LR scheduler)
+              # Hai file đó chỉ dùng để tiếp tục huấn luyện, vLLM không đọc tới.
+              # Tải chúng là phí 4.2 GB dung lượng và thời gian.
+              hf download RedHatAI/Qwen3.8-27B-speculator.dspark-preview \
+                --include "config.json" "config.py" "model.safetensors" \
+                --local-dir /models/RedHatAI/Qwen3.8-27B-speculator.dspark
+
+              echo "==> Download completed"
+              du -sh /models/Qwen/Qwen3.8-27B-FP8
+              du -sh /models/RedHatAI/Qwen3.8-27B-speculator.dspark
+              ls -la /models/RedHatAI/Qwen3.8-27B-speculator.dspark
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache

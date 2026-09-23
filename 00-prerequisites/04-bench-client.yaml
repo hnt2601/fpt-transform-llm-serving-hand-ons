@@ -1,0 +1,50 @@
+# Bench client: chứa vLLM CLI để chạy `vllm bench serve`.
+# KHÔNG xin GPU — chỉ đóng vai client sinh tải.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-client
+  namespace: token-factory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bench-client
+  template:
+    metadata:
+      labels:
+        app: bench-client
+    spec:
+      containers:
+        - name: bench
+          image: vllm/vllm-openai:latest   # production: hãy pin tag cụ thể
+          command: ["/bin/bash", "-c", "sleep infinity"]
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            # Tokenizer đọc từ PVC để không phải gọi ra HuggingFace khi bench
+            - name: MODEL_PATH
+              value: /models/Qwen/Qwen3.8-27B-FP8
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: bench-results
+              mountPath: /results
+          resources:
+            requests:
+              cpu: "8"      # client phải đủ mạnh, nếu không chính nó là bottleneck
+              memory: 16Gi
+            limits:
+              cpu: "16"
+              memory: 32Gi
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: bench-results
+          persistentVolumeClaim:
+            claimName: bench-results

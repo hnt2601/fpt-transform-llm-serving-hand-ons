@@ -1,0 +1,22 @@
+# Xác nhận node GPU đúng là H100 80GB trước khi bắt đầu benchmark.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-check
+  namespace: token-factory
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: nvidia-smi
+          image: nvidia/cuda:12.8.0-base-ubuntu24.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap \
+                         --format=csv,noheader
+          resources:
+            limits:
+              nvidia.com/gpu: 1

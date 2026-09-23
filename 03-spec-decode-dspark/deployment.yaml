@@ -1,0 +1,167 @@
+# Bài 03 — Speculative decoding với DSpark (draft song song + adaptive verification).
+# Khác bài 02: dùng speculator rời RedHatAI/Qwen3.8-27B-speculator.dspark (~4.0GB).
+# 1× H100 80GB. Deploy: kubectl apply -f deployment.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-dspark
+  namespace: token-factory
+  labels:
+    app: vllm-dspark
+    lab: "03-dspark"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-dspark
+  template:
+    metadata:
+      labels:
+        app: vllm-dspark
+        lab: "03-dspark"
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest      # production: pin tag cụ thể
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/Qwen/Qwen3.8-27B-FP8
+            - --served-model-name=qwen3.8-27b
+            - --host=0.0.0.0
+            - --port=8000
+            - --trust-remote-code
+
+            # ---- TP1: mỗi engine dùng ĐÚNG 1 GPU ----
+            # Đặt tường minh dù 1 là mặc định — toàn chuỗi bài giữ TP1 để
+            # mọi so sánh đều trên cùng một đơn vị phần cứng: 1 engine =
+            # 1 GPU. Model FP8 chỉ 27.5GB nên thừa sức vừa 1 H100; TP2 chỉ
+            # thêm chi phí all-reduce mà không giải quyết vấn đề gì.
+            - --tensor-parallel-size=1
+
+            # ---- Ngân sách bộ nhớ (H100 80GB) ----
+            # 0.86: target FP8 (~27.5GB) + speculator DSpark BF16 (~4.0GB)
+            # + CUDA graph của CẢ HAI nhánh -> KV cache còn ~37GB.
+            - --gpu-memory-utilization=0.86
+            - --max-model-len=131072   # 128k (native 262k) - xem README về ngân sách KV
+            - --kv-cache-dtype=fp8
+
+            # ---- Scheduling: chunked prefill + prefix caching ----
+            - --enable-prefix-caching
+            - --max-num-batched-tokens=8192
+            - --max-num-seqs=64
+
+            # ---- Agentic coding: reasoning + tool calling ----
+            - --reasoning-parser=qwen3
+            - --tool-call-parser=qwen3_coder
+            - --enable-auto-tool-choice
+
+            # ======================================================
+            # DSPARK SPECULATIVE DECODING
+            # ------------------------------------------------------
+            # method=dspark
+            #   Drafter song song: đề xuất cả block 8 token trong MỘT
+            #   lần chạy, thay vì 8 lượt tuần tự như EAGLE/MTP.
+            #
+            # model=/models/RedHatAI/Qwen3.8-27B-speculator.dspark
+            #   BẮT BUỘC (khác MTP). Đã tải ở bài 00 — chỉ 3 file:
+            #   config.json, config.py, model.safetensors (~4.0GB BF16).
+            #   Backbone 5 lớp sliding_attention, đọc hidden state phụ
+            #   từ 8 lớp của target (4,12,20,28,36,44,52,60),
+            #   Markov head rank 256 + confidence head.
+            #   LƯU Ý: config.py nạp qua auto_map -> cần --trust-remote-code
+            #   (đã có ở trên).
+            #
+            # num_speculative_tokens=8
+            #   PHẢI khớp "block_size": 8 trong config.json của checkpoint.
+            #   Đặt nhỏ hơn = vứt bỏ phần draft đã tính xong.
+            #
+            # Đây là cấu hình CƠ SỞ, lấy đúng từ model card. Chạy và ghi
+            # số với nó TRƯỚC.
+            # ======================================================
+            - '--speculative-config={"method":"dspark","model":"/models/RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8}'
+
+            # ------------------------------------------------------
+            # TUỲ CHỌN — Adaptive verification (bài 03, Bước 1).
+            # Confidence head của checkpoint dự đoán xác suất chấp nhận
+            # của từng vị trí -> engine tự quyết verify sâu bao nhiêu
+            # theo tải. Kỳ vọng giữ được lợi ích ở concurrency 32-64.
+            #
+            # Model card KHÔNG bật sẵn, và tài liệu vLLM tham chiếu các
+            # backend trên SM100 (H100 là SM90) -> hãy xác nhận cấu hình
+            # cơ sở chạy được TRƯỚC, rồi mới đổi sang dòng dưới đây.
+            #
+            # Comment dòng trên và bỏ comment dòng dưới:
+            # - '--speculative-config={"method":"dspark","model":"/models/RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8,"enable_adaptive_verification":true}'
+            # ------------------------------------------------------
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            # Cache biên dịch torch.compile -> lần khởi động sau nhanh hơn nhiều
+            - name: VLLM_CACHE_ROOT
+              value: /models/.vllm-cache
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+          # Model 27B mất vài phút để load + compile -> startupProbe nới rộng
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 120
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-dspark
+  namespace: token-factory
+  labels:
+    app: vllm-dspark
+spec:
+  selector:
+    app: vllm-dspark
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP

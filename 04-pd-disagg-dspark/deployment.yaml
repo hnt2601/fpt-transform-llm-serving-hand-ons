@@ -1,0 +1,375 @@
+# Bài 04 — PD Disaggregation + DSpark trên 2× H100 80GB.
+#
+# 3 thành phần:
+#   vllm-prefill : kv_producer, KHÔNG speculative decoding   -> 1 GPU
+#   vllm-decode  : kv_consumer, CÓ DSpark speculative decoding -> 1 GPU
+#   pd-proxy     : điều phối request (prefill -> decode)      -> CPU only
+#
+# ĐIỀU KIỆN TIÊN QUYẾT: cluster có 2 GPU rảnh (bài 03 đã xoá).
+#   kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
+#
+# ------------------------------------------------------------------
+# NGÂN SÁCH BỘ NHỚ — mỗi engine có GPU RIÊNG, không phải chia thủ công:
+#
+#              GPU 0 (prefill)     GPU 1 (decode)
+#   HBM            80.0 GB            80.0 GB
+#   target FP8     27.5 GB            27.5 GB
+#   speculator        —                4.0 GB
+#   context+graph   3.5 GB             4.5 GB
+#                 ─────────          ─────────
+#   KV cache     ≈ 49.0 GB          ≈ 44.0 GB
+#
+# Với --gpu-memory-utilization 0.88: prefill ~40GB KV, decode ~35GB KV.
+# Ngang ngửa một deployment agg đầy đủ (bài 01: ~40GB) ở CẢ HAI bên.
+#
+# VÌ SAO KHÔNG LÀM TRÊN 1 GPU: trọng số 27.5GB bị nạp HAI LẦN -> chỉ còn
+# ~14.5GB KV chia đôi cho hai bên. Ở max-model-len 131072, mỗi bên chỉ đủ
+# cho 1-2 sequence dài. GPU sharing (time-slicing/MPS) cũng không tạo thêm
+# SM hay băng thông —
+# bạn trả toàn bộ chi phí của PD mà gần như không nhận được lợi ích.
+# ------------------------------------------------------------------
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-prefill
+  namespace: token-factory
+  labels:
+    app: vllm-prefill
+    lab: "04-pd-dspark"
+    pd-role: prefill
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-prefill
+  template:
+    metadata:
+      labels:
+        app: vllm-prefill
+        lab: "04-pd-dspark"
+        pd-role: prefill
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/Qwen/Qwen3.8-27B-FP8
+            - --served-model-name=qwen3.8-27b
+            - --host=0.0.0.0
+            - --port=8000
+            - --trust-remote-code
+
+            # TP1: mỗi engine dùng ĐÚNG 1 GPU. Toàn chuỗi bài giữ TP1 để
+            # mọi so sánh đều trên cùng đơn vị phần cứng (1 engine = 1 GPU).
+            # PD ở đây là 2 GPU vì có 2 ENGINE, không phải vì tăng TP.
+            - --tensor-parallel-size=1
+            - --gpu-memory-utilization=0.88
+            - --max-model-len=131072   # 128k - xem README về ngân sách KV
+            - --kv-cache-dtype=fp8
+
+            # ---- Tối ưu RIÊNG cho prefill ----
+            # Nhồi nhiều token mỗi batch; ít seq nhưng mỗi seq rất dài.
+            - --max-num-batched-tokens=16384
+            - --max-num-seqs=16
+            - --enable-prefix-caching
+
+            - --reasoning-parser=qwen3
+            - --tool-call-parser=qwen3_coder
+            - --enable-auto-tool-choice
+
+            # ---- KV TRANSFER: bên SẢN XUẤT ----
+            # kv_load_failure_policy=fail -> lỗi truyền KV nổi lên rõ ràng
+            # thay vì âm thầm tính lại prefill (sẽ làm benchmark vô nghĩa).
+            - '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
+
+            # KHÔNG có --speculative-config: speculative decoding vô dụng ở
+            # prefill, vì prefill vốn đã xử lý song song hàng nghìn token.
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            # Kênh bắt tay NIXL — PHẢI khác port của decode.
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "5600"
+            - name: UCX_NET_DEVICES
+              value: "all"
+            - name: VLLM_CACHE_ROOT
+              value: /models/.vllm-cache-prefill
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: nixl
+              containerPort: 5600
+          resources:
+            requests:
+              cpu: "6"
+              memory: 48Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "12"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            failureThreshold: 120
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-prefill
+  namespace: token-factory
+spec:
+  selector:
+    app: vllm-prefill
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: nixl
+      port: 5600
+      targetPort: 5600
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-decode
+  namespace: token-factory
+  labels:
+    app: vllm-decode
+    lab: "04-pd-dspark"
+    pd-role: decode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-decode
+  template:
+    metadata:
+      labels:
+        app: vllm-decode
+        lab: "04-pd-dspark"
+        pd-role: decode
+    spec:
+      affinity:
+        # ƯU TIÊN (không bắt buộc) đặt decode cùng node với prefill, để KV
+        # cache đi qua NVLink thay vì mạng. Kiểm tra topology bằng
+        # 00-gpu-topology-job.yaml -> tìm "NV#" giữa GPU0 và GPU1.
+        #
+        # Nếu hai GPU BẮT BUỘC nằm trên hai node: PVC model-cache phải là
+        # ReadWriteMany (NFS), và băng thông mạng trở thành nút thắt mới.
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: vllm-prefill
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/Qwen/Qwen3.8-27B-FP8
+            - --served-model-name=qwen3.8-27b
+            - --host=0.0.0.0
+            - --port=8000
+            - --trust-remote-code
+
+            # TP1: mỗi engine dùng ĐÚNG 1 GPU. Toàn chuỗi bài giữ TP1 để
+            # mọi so sánh đều trên cùng đơn vị phần cứng (1 engine = 1 GPU).
+            # PD ở đây là 2 GPU vì có 2 ENGINE, không phải vì tăng TP.
+            - --tensor-parallel-size=1
+            - --gpu-memory-utilization=0.88
+            - --max-model-len=131072   # 128k - xem README về ngân sách KV
+            - --kv-cache-dtype=fp8
+
+            # ---- Tối ưu RIÊNG cho decode ----
+            # Batch rộng (nhiều seq), mỗi bước chỉ vài token/seq.
+            - --max-num-batched-tokens=2048
+            # 128 (bài 01-03 để 64): GPU decode không còn phải nhường chỗ
+            # cho prefill -> ôm được nhiều session đồng thời hơn.
+            - --max-num-seqs=128
+            - --enable-prefix-caching
+
+            - --reasoning-parser=qwen3
+            - --tool-call-parser=qwen3_coder
+            - --enable-auto-tool-choice
+
+            # ---- KV TRANSFER: bên TIÊU THỤ ----
+            - '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
+
+            # ---- DSPARK: chỉ đặt ở ĐÂY, nơi nó thực sự có tác dụng ----
+            # block_size=8 của checkpoint -> num_speculative_tokens=8.
+            # Prefill KHÔNG có cờ này: prefill vốn đã song song hàng nghìn
+            # token, speculative decoding ở đó chỉ làm chậm.
+            # Đây là lợi ích mà agg mode không có được: bật spec decoding
+            # cho ĐÚNG nửa cần nó.
+            # Xem bài 03 để biết chi tiết từng khoá và tuỳ chọn adaptive.
+            - '--speculative-config={"method":"dspark","model":"/models/RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":8}'
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            # PHẢI khác port của prefill (5600).
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "5601"
+            - name: UCX_NET_DEVICES
+              value: "all"
+            - name: VLLM_CACHE_ROOT
+              value: /models/.vllm-cache-decode
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: nixl
+              containerPort: 5601
+          resources:
+            requests:
+              cpu: "6"
+              memory: 48Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "12"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            failureThreshold: 150
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-decode
+  namespace: token-factory
+spec:
+  selector:
+    app: vllm-decode
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: nixl
+      port: 5601
+      targetPort: 5601
+  type: ClusterIP
+---
+# Proxy điều phối: nhận request -> gửi prefill -> chuyển tiếp decode.
+# Dùng toy_proxy_server.py đi kèm repo vLLM (đủ cho mục đích học tập).
+# PRODUCTION: thay bằng router thật có KV-aware routing, ví dụ router của
+# vLLM Production Stack hoặc Gateway API Inference Extension.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-proxy
+  namespace: token-factory
+  labels:
+    app: pd-proxy
+    lab: "04-pd-dspark"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pd-proxy
+  template:
+    metadata:
+      labels:
+        app: pd-proxy
+        lab: "04-pd-dspark"
+    spec:
+      initContainers:
+        # Proxy phải khởi động SAU khi cả hai engine đã ready.
+        - name: wait-for-engines
+          image: curlimages/curl:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until curl -sf http://vllm-prefill:8000/health; do
+                echo "waiting for prefill..."; sleep 10; done
+              until curl -sf http://vllm-decode:8000/health; do
+                echo "waiting for decode...";  sleep 10; done
+              echo "both engines ready"
+      containers:
+        - name: proxy
+          image: vllm/vllm-openai:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              PROXY=$(find / -name toy_proxy_server.py -path "*nixl_integration*" 2>/dev/null | head -1)
+              if [ -z "${PROXY}" ]; then
+                echo "Không tìm thấy toy_proxy_server.py trong image."
+                echo "Tải từ repo vLLM, nhánh khớp phiên bản image:"
+                echo "  tests/v1/kv_connector/nixl_integration/toy_proxy_server.py"
+                exit 1
+              fi
+              echo "Using proxy at ${PROXY}"
+              exec python3 "${PROXY}" \
+                --host 0.0.0.0 \
+                --port 8192 \
+                --prefiller-hosts vllm-prefill \
+                --prefiller-ports 8000 \
+                --decoder-hosts vllm-decode \
+                --decoder-ports 8000
+          ports:
+            - name: http
+              containerPort: 8192
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-proxy
+  namespace: token-factory
+spec:
+  selector:
+    app: pd-proxy
+  ports:
+    - name: http
+      port: 8192
+      targetPort: 8192
+  type: ClusterIP

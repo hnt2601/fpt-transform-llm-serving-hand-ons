@@ -1,0 +1,141 @@
+# Bài 02 — Speculative decoding với MTP (Multi-Token Prediction).
+# Giống bài 01, thêm --speculative-config và hạ gpu-memory-utilization 0.90 -> 0.88.
+# 1× H100 80GB. Deploy: kubectl apply -f deployment.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-mtp
+  namespace: token-factory
+  labels:
+    app: vllm-mtp
+    lab: "02-mtp"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-mtp
+  template:
+    metadata:
+      labels:
+        app: vllm-mtp
+        lab: "02-mtp"
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest      # production: pin tag cụ thể
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/Qwen/Qwen3.8-27B-FP8
+            - --served-model-name=qwen3.8-27b
+            - --host=0.0.0.0
+            - --port=8000
+            - --trust-remote-code
+
+            # ---- TP1: mỗi engine dùng ĐÚNG 1 GPU ----
+            # Đặt tường minh dù 1 là mặc định — toàn chuỗi bài giữ TP1 để
+            # mọi so sánh đều trên cùng một đơn vị phần cứng: 1 engine =
+            # 1 GPU. Model FP8 chỉ 27.5GB nên thừa sức vừa 1 H100; TP2 chỉ
+            # thêm chi phí all-reduce mà không giải quyết vấn đề gì.
+            - --tensor-parallel-size=1
+
+            # ---- Ngân sách bộ nhớ (H100 80GB) ----
+            # 0.88 (thay vì 0.90 ở bài 01): chừa thêm chỗ cho bộ đệm draft token
+            # và CUDA graph của nhánh speculative verify.
+            - --gpu-memory-utilization=0.88
+            - --max-model-len=131072   # 128k (native 262k) - xem README về ngân sách KV
+            - --kv-cache-dtype=fp8
+
+            # ---- Scheduling: chunked prefill + prefix caching ----
+            - --enable-prefix-caching
+            - --max-num-batched-tokens=8192
+            - --max-num-seqs=64
+
+            # ---- Agentic coding: reasoning + tool calling ----
+            - --reasoning-parser=qwen3
+            - --tool-call-parser=qwen3_coder
+            - --enable-auto-tool-choice
+
+            # ======================================================
+            # THAY ĐỔI DUY NHẤT SO VỚI BÀI 01
+            # ------------------------------------------------------
+            # method=mtp  : dùng MTP head đã được huấn luyện sẵn bên
+            #               trong Qwen3.8. KHÔNG cần khoá "model" —
+            #               vLLM tự trỏ draft về chính model target và
+            #               đổi architecture thành Qwen3_5MTP.
+            # num_speculative_tokens=2 : đề xuất 2 token mỗi bước.
+            #               Bài 02 Bước 5 hướng dẫn tinh chỉnh giá trị này.
+            #               Nếu image báo lỗi, hạ về 1 rồi tăng dần.
+            # ======================================================
+            - '--speculative-config={"method":"mtp","num_speculative_tokens":2}'
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            # Cache biên dịch torch.compile -> lần khởi động sau nhanh hơn nhiều
+            - name: VLLM_CACHE_ROOT
+              value: /models/.vllm-cache
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+          # Model 27B mất vài phút để load + compile -> startupProbe nới rộng
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 120
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-mtp
+  namespace: token-factory
+  labels:
+    app: vllm-mtp
+spec:
+  selector:
+    app: vllm-mtp
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
