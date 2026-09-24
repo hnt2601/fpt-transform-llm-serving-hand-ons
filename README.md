@@ -2,7 +2,7 @@
 
 **Chuỗi bài hands-on:** tối ưu phục vụ (serving) open-weight model **Qwen3.8-27B** cho workload **Agentic Coding**, triển khai bằng **Kubernetes**, đo bằng **`vllm bench serve`**.
 
-**Phần cứng:** bài 01–03 chạy trên **1× NVIDIA H100 80GB**; bài 04 (PD disaggregation) cần **2× H100 80GB**. Toàn chuỗi bài dùng **TP1** — một engine luôn là một GPU; bài 04 dùng GPU thứ hai vì nó chạy **engine thứ hai**, không phải vì xẻ nhỏ model. Lý do giải thích ở [mục 3](#3-cấu-hình-chuẩn-dùng-xuyên-suốt).
+**Phần cứng:** bài 01–03 và 06–07 chạy trên **1× NVIDIA H100 80GB**; bài 04/05/08 (PD disaggregation) cần **2–3× H100 80GB**. Toàn chuỗi bài dùng **TP1** — một engine luôn là một GPU; bài 04 dùng GPU thứ hai vì nó chạy **engine thứ hai**, không phải vì xẻ nhỏ model. Lý do giải thích ở [mục 3](#3-cấu-hình-chuẩn-dùng-xuyên-suốt).
 
 Mục tiêu: người học tự tay đi từ một baseline "chạy được" đến một cấu hình đã tối ưu, và **hiểu được vì sao** mỗi kỹ thuật lại có tác dụng — chứ không chỉ copy-paste tham số.
 
@@ -33,9 +33,45 @@ Token Factory của FPT phục vụ các agent coding (Cline / OpenHands / Claud
 | [02](02-spec-decode-mtp/) | Tối ưu 1: **Speculative decoding — MTP** | MTP head có sẵn trong Qwen3.8 | TPOT ↓, output tok/s ↑ |
 | [03](03-spec-decode-dspark/) | Tối ưu 2: **Speculative decoding — DSpark** | Drafter song song + adaptive verification | TPOT ↓↓, acceptance length ↑↑ |
 | [04](04-pd-disagg-dspark/) | Tối ưu 3: **PD Disaggregation + DSpark** | Tách Prefill/Decode qua NixlConnector | TTFT ổn định, hết interference |
+| [05](05-pd-disagg-mtp/) | Tối ưu 4: **PD Disaggregation + MTP** | PD với speculator rẻ hơn | KV cache ↑↑ |
+| [06](06-gemma4-baseline-agg/) | **Baseline MoE** + multimodal | Gemma-4-26B-A4B, ảnh ≤ 8/request | Đo đường cong batch |
+| [07](07-gemma4-spec-assistant/) | Spec decode với **assistant drafter** | Drafter dùng chung KV với backbone | TPOT ↓ |
+| [08](08-gemma4-pd-spec/) | **PD + spec trên MoE** | 1P:1D, đối chứng agg×2 | Kiểm chứng giả thuyết MoE |
 | [99](99-compare-results/) | Tổng hợp, so sánh, kết luận | — | — |
 
-**Phần 1** của khoá = bài 00 + 01. **Phần 2** = bài 02 → 05.
+**Phần 1** = bài 00 + 01. **Phần 2** = bài 02 → 05. **Phần 3** = bài 06 → 08.
+
+### Phần 3 khác gì hai phần đầu
+
+Phần 1–2 dùng Qwen3.8-27B **dense** và cho ra một kết luận dứt khoát: **PD
+thua agg ở mọi cấu hình**, và agg 3 replica thắng 2P1D toàn diện.
+
+Lý do nằm ở roofline của decode. Model **dense** đọc **toàn bộ** trọng số
+mỗi bước decode bất kể batch lớn hay nhỏ, nên `tok/s` tuyến tính theo batch
+**ngay từ batch = 1**. Chia tải ra N replica (mỗi replica batch `C/N`) gần
+như không mất gì — "thêm replica" mô phỏng được mọi lợi ích của PD, rẻ hơn
+và mịn hơn.
+
+**MoE phá vỡ điều đó.** Mỗi bước decode chỉ đọc những expert được route tới:
+
+```
+tok/s
+  │                        ╱  MoE (sau ngưỡng phủ expert)
+  │                    ╱
+  │              ╱ ╱ dense (tuyến tính từ đầu)
+  │        ╱  ╱
+  │  ╱  ╱
+  │━━━━━  ← MoE PHẲNG: batch nhỏ = lãng phí thuần
+  └─────────────────────────────── batch
+       ↑ ngưỡng phủ ≈ num_experts / top_k
+```
+
+Ở vùng phẳng, tăng concurrency **không được gì cả**. Hệ quả: "thêm replica"
+**chia** batch, đẩy mỗi engine xuống vùng phẳng — còn PD **gộp** toàn bộ
+decode vào một engine. Đây là lần đầu trong cả khoá học PD có một lợi thế
+mà horizontal scaling **không** mô phỏng được.
+
+Phần 3 kiểm chứng giả thuyết đó, **vẫn giữ TP=1**.
 
 Mỗi thư mục bài gồm:
 - `README.md` — giải thích + hướng dẫn từng bước
@@ -49,7 +85,10 @@ Mỗi thư mục bài gồm:
 
 | Tham số | Giá trị | Lý do |
 |---|---|---|
-| Model | `Qwen/Qwen3.8-27B-FP8` | FP8 → ~27.5 GB trọng số, vừa 1×H100 80GB và còn chỗ cho KV cache |
+| Model (bài 01–05) | `Qwen/Qwen3.8-27B-FP8` | FP8 → ~27.5 GB trọng số, vừa 1×H100 80GB và còn chỗ cho KV cache |
+| Model (bài 06–08) | `google/gemma-4-26B-A4B-it-fp8-dynamic` | MoE 128 expert top-8, 28.6 GB, 26B tổng / ~4B active. Attention thuần nên PD không cần `VLLM_SSM_CONV_STATE_LAYOUT=DS` |
+| Drafter (bài 07, 08) | `google/gemma-4-26B-A4B-it-assistant` | 839 MB, **dùng chung KV cache** với backbone |
+| Multimodal (bài 06–08) | `--limit-mm-per-prompt={"image":8,"video":0}` | Tối đa 8 ảnh/request; tắt video để ngân sách encoder không bị đo khuôn theo video |
 | Speculator (bài 03, 04) | `RedHatAI/Qwen3.8-27B-speculator.dspark-preview` | Định dạng `speculators` native của vLLM, `block_size = 8` |
 | Engine | `vllm/vllm-openai:v0.29.0` | Pin cứng — cùng phiên bản thì benchmark mới so được |
 | `--max-model-len` | `131072` (128k) | Đủ cho phiên agentic coding dài; giữ cố định để KV budget so sánh được. Model hỗ trợ native 262k |
