@@ -87,7 +87,20 @@ spec:
             # Rong rai hon nhieu so voi Qwen3.8-27B (~40GB) vi model nhe hon.
             - --gpu-memory-utilization=0.90
             - --max-model-len=131072
-            - --kv-cache-dtype=fp8
+            # ---- KV cache dtype: KHONG dung fp8 o Phan 3 ----
+            # Quy tac cung trong vllm/v1/attention/backends/fa_utils.py:306
+            #   return (fa_version == 3 and SM90) or (fa_version == 4 and SM100)
+            # tuc FP8 KV cache voi FLASH_ATTN chi hop le khi FA3+SM90 hoac
+            # FA4+SM100. Gemma-4 co global_head_dim=512, ma FA3 chan o
+            # head_size > 256, nen vLLM BUOC nang FA3 -> FA4 (fa_utils.py:127).
+            # FA4 + SM90 (H100) + fp8 KV => bi loai tru:
+            #   ValueError: Selected backend FLASH_ATTN is not valid.
+            #   Reason: FP8 KV cache requires FA3 on SM90 or FA4 on SM100
+            # Ep --flash-attn-version=3 cung vo ich: doan nang cap chay SAU
+            # buoc override nen no lai quay ve 4.
+            #
+            # Doi lai: KV cache giam con khoang mot nua. Voi Gemma-4 van du
+            # rong vi 25/30 layer bi chan o sliding_window=1024.
             # ---- attention-backend: BAT BUOC voi Gemma-4 tren H100 ----
             # Gemma-4 tach layer thanh NHIEU KV-cache group (sliding_window
             # 1024 cho 25/30 layer, full_attention cho 5 layer con lai). Khi
