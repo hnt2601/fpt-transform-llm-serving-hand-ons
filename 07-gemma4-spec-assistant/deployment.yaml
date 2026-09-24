@@ -121,13 +121,29 @@ spec:
             #              vLLM se lay chinh target lam draft (nhanh
             #              "self.model = target_model_config.model" o
             #              speculative.py:1106) - sai hoan toan.
-            # num_speculative_tokens=2 : assistant co n_predict=1, tuc moi
-            #              lan forward sinh DUNG 1 draft token; 2 token
-            #              nghia la chay noi tiep 2 lan. Neu engine bao loi
-            #              rang buoc n_predict, ha ve 1. Buoc 5 cua README
-            #              huong dan quet gia tri nay.
+            # num_speculative_tokens=6 : assistant co n_predict=1, tuc moi
+            #              lan forward sinh DUNG 1 draft token; 6 token
+            #              nghia la chay noi tiep 6 lan drafter truoc moi
+            #              buoc verify.
+            #
+            #              Vi sao 6 dang gia thu voi MoE (khong chi vi
+            #              "nhieu hon thi nhanh hon"):
+            #              - Drafter chi 4 layer, hidden 1024, DENSE va
+            #                khong co KV rieng -> 6 lan forward van re hon
+            #                nhieu so voi MOT buoc verify cua backbone 26B.
+            #              - Moi buoc verify xu ly 7 token/sequence thay vi
+            #                1. Voi MoE, nhieu token hon trong cung mot buoc
+            #                = nhieu expert duoc cham hon = DAY ENGINE VE
+            #                PHIA VUNG BAO HOA cua duong cong. Spec decode
+            #                va batch lon cung giai mot bai toan o day.
+            #
+            #              Rui ro can theo doi: neu acceptance length thuc
+            #              te chi ~2 thi 4 lan forward cuoi la lang phi
+            #              thuan. Buoc 6 cua README do con so nay.
+            #              Rang buoc bo nho: max-num-batched-tokens (8192)
+            #              phai >= max-num-seqs x (N+1) = 128 x 7 = 896. OK.
             # ======================================================
-            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":2}'
+            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":6}'
           env:
             - name: HF_TOKEN
               valueFrom:
