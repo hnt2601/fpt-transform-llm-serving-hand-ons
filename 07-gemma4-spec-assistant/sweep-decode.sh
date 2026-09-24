@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
-# Quet duong cong throughput theo concurrency - PHEP DO QUYET DINH cua Phan 3.
+# Quet duong cong DECODE-ISOLATED - bien the cua sweep.sh.
+#
+# VI SAO CAN BAN NAY:
+#   sweep.sh dung SPEED-Bench throughput_8k: input ~8k token, output 4096
+#   -> ti le prefill:decode ~ 2:1. Trong che do agg, chunked prefill xen
+#   ke voi decode nen TPOT do duoc CHUA CA nhieu loan tu prefill. Duong
+#   cong thu duoc la duong cong HON HOP, khong phai duong cong decode.
+#
+#   Gia thuyet "vung phang cua MoE" la mot phat bieu ve RIENG decode. De
+#   kiem tra no can input NGAN va output DAI, cho prefill gan nhu bien mat:
+#       --random-input-len 128  --random-output-len 4096   (1 : 32)
+#
+# Doc cot B/TPOT (= concurrency / TPOT, tuc token decode moi ms):
+#   B/TPOT gan nhu KHONG DOI khi c tang -> CO vung phang
+#   B/TPOT tang gan tuyen tinh theo c    -> KHONG co vung phang
 #
 # Muc tieu KHONG phai tim throughput cao nhat, ma tim DIEM GAY cua vung
 # phang trong duong cong MoE. Doc ket qua nhu sau:
@@ -30,8 +44,8 @@ TOKENIZER=/models/google/gemma-4-26B-A4B-it-fp8-dynamic
 # chon rieng bang --dataset-subset (mac dinh la "qualitative").
 # Tro thang vao file se bao:
 #   ValueError: dataset_path ... is not a directory
-DATASET_DIR=/datasets/speed-bench
-DATASET_SUBSET=throughput_8k
+# Bo decode-isolated: KHONG dung speed-bench
+
 
 # So prompt PHAI ti le voi concurrency, khong the la hang so:
 # - c=1 voi 256 prompt thi mat hang gio
@@ -76,9 +90,9 @@ for C in $CLIST; do
       --endpoint /v1/chat/completions \
       --model "$MODEL" \
       --tokenizer "$TOKENIZER" \
-      --dataset-name speed_bench \
-      --dataset-path "$DATASET_DIR" \
-      --speed-bench-dataset-subset "$DATASET_SUBSET" \
+      --dataset-name random \
+      --random-input-len 128 \
+      --random-output-len 4096 \
       --num-prompts "$NPROMPTS" \
       --max-concurrency "$C" \
       --request-rate inf \

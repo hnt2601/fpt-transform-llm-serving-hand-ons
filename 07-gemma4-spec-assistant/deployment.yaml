@@ -86,6 +86,26 @@ spec:
             - --gpu-memory-utilization=0.89
             - --max-model-len=131072
             - --kv-cache-dtype=fp8
+            # ---- attention-backend: BAT BUOC voi Gemma-4 tren H100 ----
+            # Gemma-4 tach layer thanh NHIEU KV-cache group (sliding_window
+            # 1024 cho 25/30 layer, full_attention cho 5 layer con lai). Khi
+            # bat speculative decoding, vLLM chon FlashInfer cho group
+            # sliding-window va engine chet ngay luc khoi dong:
+            #   NotImplementedError: FlashInfer backend on SM90 currently
+            #   crashes with sliding-window attention layers.
+            # (flashinfer.py:887 chan cung khi window_left != -1 tren SM90;
+            #  xem flashinfer-ai/flashinfer#3578)
+            #
+            # CAI BAY: bien moi truong VLLM_ATTENTION_BACKEND KHONG con ton
+            # tai trong vLLM 0.29.0 - dat no se bi lo di AM THAM va engine
+            # van crash y nguyen. Backend gio chi cau hinh duoc qua co
+            # --attention-backend (hoac AttentionConfig.backend_per_kind cho
+            # tung KV-cache group).
+            #
+            # Dat cho CA BA bai 06/07/08 de phep so sanh doi xung. Khong lam
+            # lech ket qua: target von da chay FA4 = FLASH_ATTN, thay o log
+            # bai 06 "Using FA4 for all layers to avoid mixed FA3/FA4 penalty".
+            - --attention-backend=TRITON_ATTN
 
             # ---- Scheduling ----
             - --enable-prefix-caching
