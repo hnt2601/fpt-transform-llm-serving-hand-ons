@@ -629,3 +629,43 @@ grep -rn "/models/Qwen\|/models/speculators" . --include="*.yaml" --include="*.m
 ---
 
 **Tiếp theo:** [Bài 01 — Baseline vLLM aggregated mode](../01-baseline-agg/)
+
+## Chuẩn bị thư viện offline (bắt buộc cho Phần 3)
+
+Dataset `speed_bench` của `vllm bench` cần **pandas** (extras `vllm[bench]`),
+không có sẵn trong image `vllm/vllm-openai`. Pod `bench-client` tự cài lúc
+khởi động — nhưng **node của workshop có thể không ra được PyPI**:
+
+```bash
+kubectl exec -n token-factory deploy/bench-client -- python3 -c \
+  'import urllib.request; urllib.request.urlopen("https://pypi.org/simple/pandas/", timeout=15)'
+```
+
+Nếu lệnh trên **timeout**, mọi Job sau này gọi `pip install` sẽ **treo vô
+hạn** ở trạng thái `Running` mà không báo lỗi gì — rất khó chẩn đoán.
+
+Cách xử lý: đưa thư viện vào PVC `bench-results` **một lần**, rồi mọi Job
+chỉ cần `export PYTHONPATH=/results/pylibs`.
+
+```bash
+kubectl exec -n token-factory deploy/bench-client -- bash -c '
+set -e
+D=/usr/local/lib/python3.12/dist-packages
+mkdir -p /results/pylibs
+for p in pandas pytz dateutil six.py tzdata \
+         pandas-*.dist-info pytz-*.dist-info \
+         python_dateutil-*.dist-info six-*.dist-info tzdata-*.dist-info; do
+  for m in $D/$p; do [ -e "$m" ] && cp -r "$m" /results/pylibs/ || true; done
+done
+ls /results/pylibs; du -sh /results/pylibs
+'
+```
+
+Kiểm tra:
+
+```bash
+kubectl exec -n token-factory deploy/bench-client -- \
+  env PYTHONPATH=/results/pylibs python3 -c 'import pandas; print(pandas.__version__)'
+```
+
+Khoảng 67 MB. Chỉ phải làm một lần cho cả cluster.

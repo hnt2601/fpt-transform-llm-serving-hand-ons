@@ -1,0 +1,201 @@
+# Bài 07 — Gemma-4-26B-A4B + speculative decoding bằng ASSISTANT drafter.
+#
+# Khác bài 06 đúng hai chỗ: --speculative-config và gpu-memory-utilization.
+#
+# DRAFTER: google/gemma-4-26B-A4B-it-assistant (839 MB, bf16)
+# ---------------------------------------------------------------
+# Đây KHÔNG phải một model nhỏ độc lập như draft model cổ điển. Đọc
+# vllm/model_executor/models/gemma4_mtp.py sẽ thấy:
+#
+#   "The Gemma4 assistant model is a lightweight decoder that SHARES KV
+#    CACHE with the target (backbone) model. All assistant decoder layers
+#    are KV-shared: they only have Q projections (no K/V projections or
+#    norms), and read K/V from the target model's cache at runtime."
+#
+# Cấu hình của nó: 4 layer, hidden_size 1024, enable_moe_block=false
+# (drafter là DENSE — chỉ backbone mới là MoE), backbone_hidden_size 2816
+# khớp với target. Nó nối vào backbone qua pre_projection/post_projection.
+#
+# vLLM 0.29.0 nhận diện checkpoint này ở config/speculative.py:981 —
+# model_type "gemma4_assistant" được viết lại thành "gemma4_mtp" với
+# n_predict=1, và num_kv_shared_layers bị ép về 0 vì việc chia sẻ KV
+# giữa hai model do proposer dựng SAU khi model được khởi tạo.
+# Vì "gemma4_mtp" nằm trong MTPModelTypes, vLLM lại rút gọn tiếp thành
+# method="mtp" (dòng 1090-1094). Nên ta khai báo thẳng method:"mtp"
+# kèm đường dẫn "model" tới assistant.
+#
+# VÌ SAO DRAFTER NÀY RẺ BẤT THƯỜNG
+# ---------------------------------
+# Drafter KHÔNG có KV cache riêng — nó đọc ké KV của target. So với bài
+# 03 (DSpark, 4.0 GB checkpoint + KV riêng làm KV cache của target tụt
+# từ 1.12 triệu xuống 550 nghìn token), ở đây cái giá gần như chỉ là
+# 839 MB trọng số. Đó là lý do hạ gpu-memory-utilization rất nhẹ:
+# 0.90 -> 0.89, thay vì 0.90 -> 0.86 như DSpark.
+#
+# 1x H100 80GB. Deploy: kubectl apply -f deployment.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-g4-spec
+  namespace: token-factory
+  labels:
+    app: vllm-g4-spec
+    lab: "07-gemma4-spec"
+spec:
+  replicas: 1
+  # Recreate: xoa pod cu XONG moi tao pod moi. Voi RollingUpdate mac dinh,
+  # ca hai pod cung xin GPU -> pod moi ket Pending vinh vien.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-g4-spec
+  template:
+    metadata:
+      labels:
+        app: vllm-g4-spec
+        lab: "07-gemma4-spec"
+    spec:
+      # Tat viec K8s tiem bien moi truong cho moi Service trong namespace:
+      # vLLM thay prefix VLLM_ nen log hang loat WARNING vo hai nhung gay
+      # hoang mang.
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.29.0
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/google/gemma-4-26B-A4B-it-fp8-dynamic
+            - --served-model-name=gemma4-26b-a4b
+            - --host=0.0.0.0
+            - --port=8000
+            - --trust-remote-code
+
+            # ---- TP1: mot engine = DUNG 1 GPU ----
+            # Trong so FP8 chi 28.6GB -> thua suc vua 1 H100 80GB.
+            # Giu TP1 xuyen suot de moi so sanh deu tren cung mot don vi
+            # phan cung.
+            - --tensor-parallel-size=1
+
+            # ---- Ngan sach bo nho (H100 80GB) ----
+            # 0.89 (bai 06 dung 0.90): chua cho trong so drafter 839MB va
+            # CUDA graph cua nhanh verify. Chi phai lui 0.01 vi drafter
+            # KHONG co KV cache rieng - no doc ke KV cua target.
+            - --gpu-memory-utilization=0.89
+            - --max-model-len=131072
+            - --kv-cache-dtype=fp8
+
+            # ---- Scheduling ----
+            - --enable-prefix-caching
+            - --max-num-batched-tokens=8192
+            # 128: giong bai 01-05 de so sanh xuyen suot khoa hoc duoc.
+            # Day la TRAN cua batch decode; bien thuc su duoc quet la
+            # --max-concurrency o phia client.
+            - --max-num-seqs=128
+
+            # ---- MULTIMODAL: toi da 8 anh moi request ----
+            # Mac dinh vLLM la 999 anh/modality. Con so do di vao buoc
+            # profiling bo nho luc khoi dong, nen de mac dinh vua khong
+            # thuc te vua lang phi ngan sach activation.
+            # Gemma-4 dung 280 soft token cho moi anh (vision_soft_tokens
+            # _per_image), nen 8 anh = 2.240 token placeholder.
+            - '--limit-mm-per-prompt={"image":8,"video":0}'
+
+            # ---- Reasoning + tool calling ----
+            # Ten parser da dang ky trong vLLM 0.29.0 la "gemma4" cho CA HAI
+            # (vllm/tool_parsers/__init__.py, vllm/reasoning/__init__.py).
+            - --reasoning-parser=gemma4
+            - --tool-call-parser=gemma4
+            - --enable-auto-tool-choice
+
+            # ======================================================
+            # THAY DOI DUY NHAT SO VOI BAI 06 (ngoai gpu-mem-util)
+            # ------------------------------------------------------
+            # method=mtp : bat buoc phai la "mtp". vLLM doc config cua
+            #              drafter, thay model_type=gemma4_assistant, tu
+            #              viet lai thanh Gemma4MTPModel. Dat "gemma4_mtp"
+            #              cung chay nhung se bi canh bao deprecated.
+            # model      : PHAI tro tuong minh toi assistant. Neu bo trong,
+            #              vLLM se lay chinh target lam draft (nhanh
+            #              "self.model = target_model_config.model" o
+            #              speculative.py:1106) - sai hoan toan.
+            # num_speculative_tokens=2 : assistant co n_predict=1, tuc moi
+            #              lan forward sinh DUNG 1 draft token; 2 token
+            #              nghia la chay noi tiep 2 lan. Neu engine bao loi
+            #              rang buoc n_predict, ha ve 1. Buoc 5 cua README
+            #              huong dan quet gia tri nay.
+            # ======================================================
+            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":2}'
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            # Thu muc trong so duoc mount READ-ONLY -> cache torch.compile
+            # phai ghi sang PVC rieng.
+            - name: VLLM_CACHE_ROOT
+              value: /cache
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: vllm-cache
+              mountPath: /cache
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            failureThreshold: 120
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        - name: vllm-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-g4-spec
+  namespace: token-factory
+  labels:
+    app: vllm-g4-spec
+spec:
+  selector:
+    app: vllm-g4-spec
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP

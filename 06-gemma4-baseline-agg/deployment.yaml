@@ -1,0 +1,191 @@
+# Bài 06 — BASELINE cho PHẦN 3: Gemma-4-26B-A4B (MoE) ở chế độ agg, KHÔNG spec.
+#
+# VÌ SAO ĐỔI MODEL Ở PHẦN 3
+# -------------------------
+# Phần 1-2 (bài 01-05) dùng Qwen3.8-27B — model DENSE. Kết luận đo được:
+# PD thua agg ở mọi cấu hình, và agg 3 replica thắng 2P1D toàn diện.
+#
+# Lý do gốc: với model dense, throughput decode TĂNG TUYẾN TÍNH theo batch
+# ngay từ batch=1, vì mỗi bước decode luôn phải đọc TOÀN BỘ trọng số từ
+# HBM bất kể batch lớn hay nhỏ. Nên chia tải ra 3 replica (mỗi replica
+# batch C/3) gần như không mất gì — mà lại giảm hẳn interference.
+# "Thêm replica" mô phỏng được mọi lợi ích của PD, với giá rẻ hơn.
+#
+# MoE phá vỡ điều đó. Mỗi bước decode chỉ đọc những expert được route tới:
+#   batch nhỏ  -> chạm ~B*top_k expert -> lượng đọc TỈ LỆ THUẬN với B
+#                 -> throughput PHẲNG, tăng concurrency không được gì
+#   batch lớn  -> phủ hết expert, lượng đọc BÃO HOÀ -> tuyến tính trở lại
+#
+#   tok/s
+#     |                        /   MoE (sau ngưỡng phủ expert)
+#     |                    /
+#     |              / /  dense (tuyến tính từ batch=1)
+#     |        /  /
+#     |  / /
+#     |=====   <- MoE PHẲNG: batch nhỏ = lãng phí thuần
+#     +---------------------------------- batch
+#          ^ ngưỡng phủ ~ num_experts/top_k = 128/8 = 16
+#
+# Hệ quả: MoE cần một decode batch LỚN, LIÊN TỤC, KHÔNG BỊ NGẮT — cấp
+# thiết hơn dense rất nhiều. Đó đúng là thứ PD bán. Và lần đầu tiên nó là
+# lợi thế mà "thêm replica" KHÔNG mô phỏng được, vì thêm replica thì CHIA
+# batch, đẩy mỗi engine xuống vùng phẳng.
+#
+# MỤC TIÊU BÀI 06: đo đường cong tok/s theo --max-concurrency để TÌM ĐIỂM
+# GÃY của vùng phẳng. Nếu KHÔNG có vùng phẳng thì giả thuyết sai và ta
+# dừng — không phí GPU cho bài 07/08.
+#
+# 1x H100 80GB. Deploy: kubectl apply -f deployment.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-g4-agg
+  namespace: token-factory
+  labels:
+    app: vllm-g4-agg
+    lab: "06-gemma4-baseline"
+spec:
+  replicas: 1
+  # Recreate: xoa pod cu XONG moi tao pod moi. Voi RollingUpdate mac dinh,
+  # ca hai pod cung xin GPU -> pod moi ket Pending vinh vien.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-g4-agg
+  template:
+    metadata:
+      labels:
+        app: vllm-g4-agg
+        lab: "06-gemma4-baseline"
+    spec:
+      # Tat viec K8s tiem bien moi truong cho moi Service trong namespace:
+      # vLLM thay prefix VLLM_ nen log hang loat WARNING vo hai nhung gay
+      # hoang mang.
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.29.0
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/google/gemma-4-26B-A4B-it-fp8-dynamic
+            - --served-model-name=gemma4-26b-a4b
+            - --host=0.0.0.0
+            - --port=8000
+            - --trust-remote-code
+
+            # ---- TP1: mot engine = DUNG 1 GPU ----
+            # Trong so FP8 chi 28.6GB -> thua suc vua 1 H100 80GB.
+            # Giu TP1 xuyen suot de moi so sanh deu tren cung mot don vi
+            # phan cung.
+            - --tensor-parallel-size=1
+
+            # ---- Ngan sach bo nho (H100 80GB) ----
+            # 0.90 * 80 = 72GB ; trong so 28.6GB -> KV cache ~43GB.
+            # Rong rai hon nhieu so voi Qwen3.8-27B (~40GB) vi model nhe hon.
+            - --gpu-memory-utilization=0.90
+            - --max-model-len=131072
+            - --kv-cache-dtype=fp8
+
+            # ---- Scheduling ----
+            - --enable-prefix-caching
+            - --max-num-batched-tokens=8192
+            # 128: giong bai 01-05 de so sanh xuyen suot khoa hoc duoc.
+            # Day la TRAN cua batch decode; bien thuc su duoc quet la
+            # --max-concurrency o phia client.
+            - --max-num-seqs=128
+
+            # ---- MULTIMODAL: toi da 8 anh moi request ----
+            # Mac dinh vLLM la 999 anh/modality. Con so do di vao buoc
+            # profiling bo nho luc khoi dong, nen de mac dinh vua khong
+            # thuc te vua lang phi ngan sach activation.
+            # Gemma-4 dung 280 soft token cho moi anh (vision_soft_tokens
+            # _per_image), nen 8 anh = 2.240 token placeholder.
+            #
+            # "video":0 TAT HAN video. Khong phai cho gon: de mac dinh 999,
+            # log khoi dong bao "Encoder cache will be initialized with a
+            # budget of 8192 tokens, and profiled with 3 VIDEO items of the
+            # maximum feature size" - tuc ngan sach encoder bi do khuon theo
+            # video ma bai toan khong he dung. Tat di thi ngan sach do danh
+            # het cho anh.
+            - '--limit-mm-per-prompt={"image":8,"video":0}'
+
+            # ---- Reasoning + tool calling ----
+            # Ten parser da dang ky trong vLLM 0.29.0 la "gemma4" cho CA HAI
+            # (vllm/tool_parsers/__init__.py, vllm/reasoning/__init__.py).
+            - --reasoning-parser=gemma4
+            - --tool-call-parser=gemma4
+            - --enable-auto-tool-choice
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            # Thu muc trong so duoc mount READ-ONLY -> cache torch.compile
+            # phai ghi sang PVC rieng.
+            - name: VLLM_CACHE_ROOT
+              value: /cache
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: vllm-cache
+              mountPath: /cache
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            failureThreshold: 120
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        - name: vllm-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-g4-agg
+  namespace: token-factory
+  labels:
+    app: vllm-g4-agg
+spec:
+  selector:
+    app: vllm-g4-agg
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
