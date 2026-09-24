@@ -154,10 +154,22 @@ spec:
             #              vLLM se lay chinh target lam draft (nhanh
             #              "self.model = target_model_config.model" o
             #              speculative.py:1106) - sai hoan toan.
-            # num_speculative_tokens=6 : assistant co n_predict=1, tuc moi
-            #              lan forward sinh DUNG 1 draft token; 6 token
-            #              nghia la chay noi tiep 6 lan drafter truoc moi
+            # num_speculative_tokens=4 : assistant co n_predict=1, tuc moi
+            #              lan forward sinh DUNG 1 draft token; 4 token
+            #              nghia la chay noi tiep 4 lan drafter truoc moi
             #              buoc verify.
+            #
+            #              VI SAO 4 chu khong phai 6: do thuc te voi nspec=6
+            #              cho thay acceptance tat rat nhanh theo do sau.
+            #              Per-position acceptance rate o tai cao nhat:
+            #                  0.734, 0.423, 0.287, 0.222, 0.195, 0.174
+            #              Tich luy:
+            #                  1.73, 2.16, 2.44, 2.67, 2.86, 3.03
+            #              Vi tri 5 va 6 chi them 0,37 token trong tong 3,03
+            #              (12% loi ich) nhung ton 2/6 = 33% chi phi drafter.
+            #              Day dung la dieu speculative.py:1318 canh bao:
+            #              chay lap cung mot MTP layer lam acceptance rate
+            #              tut nhanh theo do sau.
             #
             #              Vi sao 6 dang gia thu voi MoE (khong chi vi
             #              "nhieu hon thi nhanh hon"):
@@ -176,7 +188,7 @@ spec:
             #              Rang buoc bo nho: max-num-batched-tokens (8192)
             #              phai >= max-num-seqs x (N+1) = 128 x 7 = 896. OK.
             # ======================================================
-            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":6}'
+            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'
           env:
             - name: HF_TOKEN
               valueFrom:

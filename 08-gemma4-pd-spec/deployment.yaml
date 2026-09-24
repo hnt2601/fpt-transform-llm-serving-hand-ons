@@ -137,7 +137,7 @@ spec:
             # hai engine. Lech cau hinh -> o bai 04 decode sinh ra RAC
             # (HTTP 200 kem chuoi "!ductductduct...") ma KHONG bao loi.
             # Day la loi nguy hiem nhat ca chuoi bai lab.
-            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":6}'
+            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'
           env:
             - name: HF_TOKEN
               valueFrom: { secretKeyRef: { name: hf-token, key: token } }
@@ -291,7 +291,7 @@ spec:
             - --enable-auto-tool-choice
 
             - '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
-            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":6}'
+            - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'
           env:
             - name: HF_TOKEN
               valueFrom: { secretKeyRef: { name: hf-token, key: token } }

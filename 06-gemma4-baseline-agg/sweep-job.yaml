@@ -14,7 +14,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: sweep-script
+  name: sweep-script-agg
   namespace: token-factory
 data:
   sweep.sh: |
@@ -117,7 +117,7 @@ data:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: sweep-bench
+  name: sweep-bench-agg
   namespace: token-factory
 spec:
   backoffLimit: 0          # loi thi DUNG han, khong chay lai nua de tranh
@@ -151,7 +151,7 @@ spec:
           env:
             # ---- HAI BIEN DUY NHAT CAN DOI GIUA CAC BAI ----
             - name: LAB
-              value: "06-g4-agg"
+              value: "06-g4-agg-fa4"
             - name: BASE_URL
               value: "http://vllm-g4-agg:8000"
             - name: HF_TOKEN
@@ -171,7 +171,7 @@ spec:
             - { name: results,  mountPath: /results }
       volumes:
         - name: script
-          configMap: { name: sweep-script, defaultMode: 0755 }
+          configMap: { name: sweep-script-agg, defaultMode: 0755 }
         - name: models
           persistentVolumeClaim: { claimName: model-cache, readOnly: true }
         - name: datasets
