@@ -171,22 +171,36 @@ spec:
             #              chay lap cung mot MTP layer lam acceptance rate
             #              tut nhanh theo do sau.
             #
-            #              Vi sao 6 dang gia thu voi MoE (khong chi vi
-            #              "nhieu hon thi nhanh hon"):
+            #              VI SAO 4 chu khong phai 8: A/B chay song song, cung
+            #              sweep (sampling temperature 1.0 mac dinh):
+            #                               K=4          K=8
+            #                acceptance     3.21-3.34    4.03-4.08
+            #                tok/s c=8..128 (K8/K4)      0.65-0.97x
+            #                tok/s c=128    4740-4846    3892-4105
+            #              K=8 chi thang TPOT o c=1-2 (2.11 -> 1.68 ms).
+            #              Assistant MTP draft TUAN TU: 8 token = 8 luot
+            #              drafter, va target phai verify 9 vi tri moi
+            #              request; vi tri 5-8 chi duoc chap nhan 22-30%.
+            #
+            #              KHONG them draft_sample_method=probabilistic +
+            #              rejection_sample_method=block (giup Qwen3.8
+            #              DSpark +3-13%, xem bai 03): voi Gemma-4 A/B cho
+            #              TPOT B/A ~1.00 va acceptance chi +4% (K=4) /
+            #              +1% (K=8) - khong do duoc loi ich, ma probabilistic
+            #              ton them bo nho de giu draft logits.
+            #
+            #              Vi sao spec decode dang gia voi MoE:
             #              - Drafter chi 4 layer, hidden 1024, DENSE va
-            #                khong co KV rieng -> 6 lan forward van re hon
+            #                khong co KV rieng -> 4 lan forward van re hon
             #                nhieu so voi MOT buoc verify cua backbone 26B.
-            #              - Moi buoc verify xu ly 7 token/sequence thay vi
+            #              - Moi buoc verify xu ly 5 token/sequence thay vi
             #                1. Voi MoE, nhieu token hon trong cung mot buoc
             #                = nhieu expert duoc cham hon = DAY ENGINE VE
             #                PHIA VUNG BAO HOA cua duong cong. Spec decode
             #                va batch lon cung giai mot bai toan o day.
             #
-            #              Rui ro can theo doi: neu acceptance length thuc
-            #              te chi ~2 thi 4 lan forward cuoi la lang phi
-            #              thuan. Buoc 6 cua README do con so nay.
             #              Rang buoc bo nho: max-num-batched-tokens (8192)
-            #              phai >= max-num-seqs x (N+1) = 128 x 7 = 896. OK.
+            #              phai >= max-num-seqs x (N+1) = 128 x 5 = 640. OK.
             # ======================================================
             - '--speculative-config={"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'
           env:

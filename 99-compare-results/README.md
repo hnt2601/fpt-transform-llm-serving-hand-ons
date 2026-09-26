@@ -118,6 +118,63 @@ Cột cuối là cột dùng để ra quyết định mua sắm: nếu nó thấ
 
 Cột cuối **không phụ thuộc số GPU** — đó là lý do nó là phép so sánh sạch nhất giữa agg và PD.
 
+### 2.5 Phần 3 — Gemma-4-26B-A4B (MoE), bài 06–08
+
+So hai bộ sweep bất kỳ theo từng mức concurrency bằng `compare-spec.py`:
+
+```bash
+POD=$(kubectl get pod -n token-factory -l app=bench-client -o jsonpath='{.items[0].metadata.name}')
+kubectl cp compare-spec.py token-factory/$POD:/tmp/compare-spec.py
+kubectl exec -n token-factory $POD -- python3 /tmp/compare-spec.py 06-g4-agg-fa4 07-g4-spec-n4 baseline spec
+```
+
+<details>
+<summary><b>Số đo tham chiếu bài 06–08</b> — H100 80GB, TP1, SPEED-Bench <code>throughput_8k</code>, sampling temperature 1.0 mặc định</summary>
+
+**Output throughput (tok/s) / TPOT p50 (ms)**
+
+| Conc | 06 agg (1 GPU) | 07 spec K=4 (1 GPU) | 07 spec × 2 replica (2 GPU) | 08 1P1D NVLink (2 GPU) |
+|---:|---:|---:|---:|---:|
+| 1 | 191 / 5.19 | 315 / 2.31 | 369 / 2.27 | **415 / 2.04** |
+| 8 | 936 / 8.48 | 1735 / 3.56 | 1303 / 3.71 | **1777 / 3.32** |
+| 32 | 2106 / 14.96 | 3373 / 6.37 | **4163 / 4.96** | 3569 / 5.89 |
+| 64 | 2781 / 21.81 | 4524 / 9.68 | **6725 / 6.73** | 5225 / 8.03 |
+| 128 | 2970 / 32.04 | 4657 / 14.30 | **8044 / 9.86** | 3863 / 20.42 |
+
+**Kết luận Phần 3:**
+
+- **Spec decode (assistant MTP, K=4) thắng baseline ở mọi c:** TPOT ~0,43–0,45x,
+  throughput 1,11–1,85x. Đổi lại TTFT tệ hơn 1,3–1,9x ở c=16–48.
+- **K=4 là điểm tối ưu.** K=6 và K=8 tăng acceptance (3,03 / 4,08 so với ~3,3)
+  nhưng throughput dưới tải thấp hơn (K=8 chỉ 0,65–0,97x so với K=4 ở c ≥ 8) vì
+  assistant MTP draft tuần tự. Chúng chỉ thắng TPOT ở c=1–2.
+- **PD thua thêm replica.** Cùng 2 GPU, 1P1D qua NVLink chỉ đạt 0,76–0,86x
+  agg×2 ở c ≥ 16, và 0,48x ở c=128 khi KV cache của D đầy. Giả thuyết "PD thắng
+  ở concurrency trung bình nhờ gom batch MoE" **bị bác bỏ** — chi tiết ở
+  [bài 08, mục 6](../08-gemma4-pd-spec/README.md#6-kết-quả).
+- **PD hai pod 1 GPU = KV đi TCP** (~365 MB/s), kể cả khi cùng node: throughput
+  kẹt ~2.200 tok/s. Muốn NVLink thì P và D phải thấy GPU của nhau (cùng pod).
+
+</details>
+
+### 2.6 Tuỳ chọn speculative: `probabilistic` + `block`, adaptive verification
+
+Hai model đều mặc định `temperature=1.0` và `vllm bench serve` không ép greedy,
+nên mọi số đo ở đây đều **lấy mẫu**. A/B chỉ đổi đúng hai khoá
+`draft_sample_method: greedy → probabilistic` và
+`rejection_sample_method: standard → block`, hai pod chạy song song:
+
+| Model / drafter | K | Acceptance length | Throughput B/A | TPOT B/A | Áp dụng? |
+|---|---:|---|---|---|---|
+| Qwen3.8 / DSpark (song song) | 8 | 2.77 → **3.16** | **1.03–1.13x** | 0.89–0.95x | ✅ bài 03, 04 |
+| Gemma-4 / assistant MTP (tuần tự) | 4 | 3.21 → 3.34 | nhiễu, 0.85–1.24x | ~1.00x | ❌ |
+| Gemma-4 / assistant MTP (tuần tự) | 8 | 4.03 → 4.08 | nhiễu, 0.79–2.02x | ~1.00x (trừ c=1–2) | ❌ |
+
+`enable_adaptive_verification` **không chạy được trên H100**: nó cần attention
+backend đọc query length từ device, trong vLLM 0.29 chỉ có FlashInfer
+trtllm-gen (SM100 / Blackwell) và MLA indexer (DeepSeek). Xem
+[bài 03, mục 2](../03-spec-decode-dspark/README.md#2-adaptive-verification).
+
 ## 3. Bốn câu hỏi phải trả lời được
 
 Nếu bạn trả lời được cả bốn, bạn đã đạt mục tiêu của khoá.
@@ -160,6 +217,8 @@ Khung suy luận chung — hãy kiểm chứng bằng số liệu của bạn:
 - **Mặc định nên bật:** FP8 weights + FP8 KV cache + prefix caching + chunked prefill. Bốn thứ này gần như không có nhược điểm cho agentic coding.
 - **MTP là lựa chọn đầu tiên** khi thêm speculative decoding: một cờ, không tốn VRAM, không cần quản checkpoint.
 - **DSpark đáng đổi ~4 GB VRAM** khi phần lớn tải chạy ở concurrency thấp–trung bình và workload thiên về sinh code. Nếu agent của bạn chủ yếu gọi tool (acceptance ~3.57) thay vì sinh code (~4.20), lợi ích nhỏ hơn — hãy đo bằng trace thật.
+- **Với DSpark, thêm `draft_sample_method: probabilistic` + `rejection_sample_method: block`** khi phục vụ ở temperature > 0 (+3–13% đo được, lossless). Đừng mặc định chép sang drafter khác: với assistant MTP của Gemma-4 hai cờ này không đo được lợi ích (mục 2.6).
+- **Model MoE (Gemma-4-26B-A4B): thêm replica agg thay vì tách PD** khi có GPU thứ hai (mục 2.5).
 - **PD disaggregation cần ≥ 2 GPU cho model 27B.** Chọn nó khi TPOT p99 ổn định quan trọng hơn throughput trung bình, hoặc khi bạn cần scale prefill và decode độc lập theo tải.
 
 ## 5. Việc chưa làm trong khoá này
@@ -172,7 +231,7 @@ Khoá này cố ý giữ phạm vi hẹp để tập trung vào PD serving và s
 | **Offload KV cache ra CPU/NVMe** | Mở rộng KV cache vượt giới hạn HBM — đúng vấn đề ta gặp ở bài 04 | [production-stack tutorial 05, 06](../../production-stack/tutorials/) |
 | **Autoscaling** | Tải agentic coding rất thất thường theo giờ làm việc | [production-stack tutorial 10, 20](../../production-stack/tutorials/) |
 | **Đo bằng trace thật** | SPEED-Bench đã là prompt thật, nhưng tỉ lệ code ⇄ tool_call trong agent của bạn mới quyết định con số cuối. Dùng `--dataset-name custom --dataset-path <trace.jsonl>` | [vllm bench serve](https://docs.vllm.ai/en/stable/cli/bench/serve/) |
-| **So PD 1:1 với 2 replica agg** | Cùng 2 GPU, cùng TP1, khác kiến trúc — quyết định thật khi có GPU thứ hai. Chỉ cần `kubectl scale --replicas=2` ở bài 03 | Bài 04, mục 2 |
+| **So PD 1:1 với 2 replica agg cho Qwen3.8** | Đã làm cho Gemma-4 ở bài 08 (agg×2 thắng). Model dense 27B chưa được đo cùng cách. Chỉ cần `kubectl scale --replicas=2` ở bài 03 | Bài 04, mục 2; bài 08, mục 6 |
 | **Thử tensor parallel** | Chuỗi bài cố ý giữ TP1. TP2 đáng thử khi cần ép TPOT xuống thấp hơn nữa và chấp nhận chi phí all-reduce | — |
 | **Tỉ lệ P:D khác 1:1** | Với ≥ 3 GPU, tỉ lệ 2:1 hoặc 1:2 thường tốt hơn | Bài 04, Bước 6 |
 | **Đánh giá chất lượng, không chỉ tốc độ** | Speculative decoding là lossless về mặt phân phối, nhưng FP8 weights/KV thì không. Cần đo HumanEval/MBPP trước–sau khi lượng tử hoá | — |
