@@ -2,7 +2,7 @@
 
 ## Giới thiệu
 
-MTP ở bài 02 cho bạn acceptance length khoảng 1.5–2.0 với công sức gần như bằng 0. Bài này đi xa hơn: **DSpark**, một drafter chuyên dụng đạt acceptance length **3.4–4.0 trên workload code**, cộng thêm **adaptive verification** — cơ chế tự điều chỉnh độ sâu speculation theo tải, đúng thứ mà bài 02 đã chỉ ra là còn thiếu.
+MTP ở bài 02 cho bạn acceptance length khoảng 1.5–2.0 với công sức gần như bằng 0. Bài này đi xa hơn: **DSpark**, một drafter chuyên dụng đạt acceptance length **3.4–4.0 trên workload code**, cộng thêm **block verification + draft lấy mẫu** — hai cờ đo được giúp tăng acceptance length từ 2.77 lên 3.16 khi sampling ở temperature 1.0. (Adaptive verification, cơ chế tự điều chỉnh độ sâu theo tải, **không chạy được trên H100** — xem [mục 2](#2-adaptive-verification).)
 
 ## Mục lục
 
@@ -107,7 +107,26 @@ Tải cao,   drafter do dự   → verify 2-3 token    → không lãng phí com
 
 Nhờ vậy lợi ích được giữ trên dải concurrency rộng mà **không cần tự tay tinh chỉnh cho từng mức tải** — khác hẳn việc dò `num_speculative_tokens` bằng tay ở bài 02 Bước 5. Đây là tính năng khiến DSpark dùng được trong production thật, nơi tải thay đổi theo giờ.
 
-Bật bằng khoá `"enable_adaptive_verification": true`.
+Bật bằng khoá `"enable_adaptive_verification": true` — **nhưng không phải trên H100.**
+
+> ### ⚠️ Adaptive verification cần GPU Blackwell (SM100)
+>
+> Checkpoint có confidence head (`enable_confidence_head: true`), nên phía
+> drafter không phải vấn đề. Vấn đề ở attention backend: adaptive
+> verification **cắt draft ngay trên GPU**, nên số query của mỗi request
+> trên device khác với con số CPU đã lên kế hoạch. Backend phải đọc query
+> length từ device tensor (`supports_device_cpu_query_lens_mismatch`).
+>
+> Trong vLLM 0.29 chỉ hai đường làm được:
+>
+> | Backend | Điều kiện |
+> |---|---|
+> | FlashInfer trtllm-gen decode | `is_device_capability_family(100)` — **SM100 / Blackwell** |
+> | MLA indexer | Chỉ model dùng MLA (DeepSeek) |
+>
+> H100 là SM90, Qwen3.8 dùng attention thường → engine không tìm được
+> backend hợp lệ và chết lúc khởi động. Đó cũng là lý do một cấu hình cho
+> DeepSeek bật được cờ này còn Qwen3.8 trên H100 thì không.
 
 ## 3. Checkpoint speculator
 
@@ -187,13 +206,15 @@ kubectl logs -f deploy/vllm-dspark -n token-factory
 
 ### Khối `--speculative-config` của bài này
 
-Model card của checkpoint đưa ra lệnh tối giản sau — ta dùng đúng nó làm cấu hình cơ sở:
+Ba khoá đầu lấy đúng từ model card; hai khoá cuối được thêm sau khi A/B bên dưới cho thấy chúng có lợi:
 
 ```json
 {
   "method": "dspark",
   "model": "/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview",
-  "num_speculative_tokens": 8
+  "num_speculative_tokens": 8,
+  "draft_sample_method": "probabilistic",
+  "rejection_sample_method": "block"
 }
 ```
 
@@ -202,27 +223,35 @@ Model card của checkpoint đưa ra lệnh tối giản sau — ta dùng đúng
 | `method` | `dspark` | Chọn thuật toán draft song song DSpark |
 | `model` | đường dẫn PVC | **Bắt buộc** — khác MTP, DSpark cần checkpoint speculator rời |
 | `num_speculative_tokens` | `8` | Khớp đúng `block_size: 8` trong `config.json` của checkpoint |
+| `draft_sample_method` | `probabilistic` | Drafter **lấy mẫu** từ phân phối của nó (mặc định `greedy` = luôn lấy argmax) và giữ toàn bộ draft logits cho phép kiểm tra tỉ lệ xác suất |
+| `rejection_sample_method` | `block` | **Block verification** (Sun et al.): verify cả block draft cùng lúc, thay vì `standard` dừng ở token đầu tiên bị từ chối |
 
 > **`num_speculative_tokens` phải khớp `block_size`.** DSpark sinh cả block trong một lần chạy; đặt giá trị nhỏ hơn 8 là vứt bỏ phần draft đã tính xong mà vẫn trả tiền compute cho nó. Nếu bạn đổi sang checkpoint DSpark khác, **đọc `block_size` trong `config.json` của nó** thay vì đoán.
 
-### Tuỳ chọn: bật adaptive verification
+### Vì sao thêm `probabilistic` + `block` — A/B đã đo
 
-Model card không bật sẵn. Sau khi đã xác nhận cấu hình cơ sở chạy được ở Bước 2, hãy thử thêm:
+Hai cờ này chỉ có tác dụng khi **lấy mẫu** (temperature > 0). `generation_config.json` của Qwen3.8 mặc định `temperature=1.0`, và `vllm bench serve` **không còn ép** temperature=0 — nên cả benchmark lẫn production đều đang lấy mẫu. Cả hai cờ vẫn **lossless**: phân phối đầu ra của target không đổi.
 
-```json
-{
-  "method": "dspark",
-  "model": "/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview",
-  "num_speculative_tokens": 8,
-  "enable_adaptive_verification": true
-}
-```
+| | Cấu hình A (model card) | Cấu hình B (đang dùng) |
+|---|---|---|
+| `draft_sample_method` | `greedy` (mặc định) | **`probabilistic`** |
+| `rejection_sample_method` | `standard` (mặc định) | **`block`** |
+| Mọi khoá khác | `dspark`, `num_speculative_tokens: 8` | giống hệt |
 
-Rồi đo lại và so sánh — **đặc biệt ở concurrency 32 và 64**, nơi ta đã dự đoán ở bài 02 rằng lợi ích sẽ teo lại. Đây là một thí nghiệm có đối chứng đúng nghĩa: cùng checkpoint, cùng mọi thứ, chỉ khác một cờ.
+Đo trên H100, hai pod chạy **song song**, cùng lệnh Bước 3 (`--seed 42`, `throughput_8k`, output 1000):
 
-`deployment.yaml` để cấu hình cơ sở ở dạng đang dùng và cấu hình adaptive ở dạng comment ngay bên dưới — đổi bằng cách bỏ comment.
+| c | A tok/s | B tok/s | Thay đổi | TPOT A → B (ms) | Lý do |
+|---|---|---|---|---|---|
+| 1 | 143.7 | 162.5 | **+13%** | 6.61 → 5.88 | 1 request: tốc độ decode quyết định tất cả, thêm token được chấp nhận là lợi gần như thuần |
+| 8 | 553.2 | 606.7 | **+10%** | 12.57 → 11.88 | Batch còn nhỏ, GPU chưa thắt cổ chai |
+| 32 | 686.5 | 705.1 | +3% | 21.47 → 20.23 | GPU đã bão hoà, chấp nhận thêm token tiết kiệm ít compute hơn |
+| 64 | 689.5 | 713.3 | +3% | 21.59 → 20.03 | Nút thắt chính là hàng đợi prefill (TTFT ~68 s ở cả hai), không phải decode |
 
-> **Thứ tự này là cố ý.** Đừng bật cả hai thứ mới cùng lúc rồi không biết cái nào có tác dụng. Chạy cơ sở → ghi số → thêm một biến → đo lại. Đây là cách duy nhất để kết luận có giá trị.
+**Acceptance length trung bình: 2.77 → 3.16 (+14%)**. TTFT không đổi — hai cờ chỉ chạm vào decode.
+
+Cơ chế: ở temperature 1.0 target **lấy mẫu**, nên draft argmax hay bị lệch khỏi token target thực sự chọn — `probabilistic` cho draft khớp phân phối hơn. `block` cộng thêm bằng cách chấp nhận được tiền tố dài hơn so với kiểm tra từng token.
+
+> **Không áp dụng được cho Gemma-4 (bài 07).** Cùng A/B đó với assistant MTP của Gemma-4 cho TPOT gần như không đổi và acceptance chỉ +1–4%, cả ở K=4 lẫn K=8. DSpark hưởng lợi vì drafter sinh cả 8 token trong **một** lượt song song với acceptance cao; assistant MTP draft **tuần tự**, acceptance tụt nhanh theo độ sâu, hai cờ này không sửa được điều đó.
 
 ## Bước 2: Kiểm tra acceptance
 

@@ -92,23 +92,38 @@ spec:
             #   PHẢI khớp "block_size": 8 trong config.json của checkpoint.
             #   Đặt nhỏ hơn = vứt bỏ phần draft đã tính xong.
             #
-            # Đây là cấu hình CƠ SỞ, lấy đúng từ model card. Chạy và ghi
-            # số với nó TRƯỚC.
+            # draft_sample_method=probabilistic
+            #   Drafter LẤY MẪU từ phân phối của nó thay vì argmax, và giữ
+            #   toàn bộ draft logits cho phép kiểm tra tỉ lệ xác suất.
+            # rejection_sample_method=block
+            #   Block verification (Sun et al.): verify cả block draft
+            #   CÙNG LÚC thay vì dừng ở token đầu tiên bị từ chối.
+            #
+            # Hai cờ này CHỈ có tác dụng khi sampling (temperature > 0).
+            # generation_config.json của Qwen3.8 mặc định temperature=1.0,
+            # và `vllm bench serve` KHÔNG còn ép temperature=0 -> bench và
+            # production đều đang lấy mẫu. Cả hai vẫn lossless.
+            #
+            # A/B đo trên H100, chạy song song, cùng seed (throughput_8k,
+            # output 1000):
+            #          greedy+standard  ->  probabilistic+block
+            #   c=1    143.7 tok/s          162.5   (+13%)  TPOT 6.61->5.88 ms
+            #   c=8    553.2                606.7   (+10%)
+            #   c=32   686.5                705.1   (+3%)
+            #   c=64   689.5                713.3   (+3%)   TPOT 21.6->20.0 ms
+            #   acceptance length trung bình 2.77 -> 3.16; TTFT không đổi.
             # ======================================================
-            - '--speculative-config={"method":"dspark","model":"/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview","num_speculative_tokens":8}'
+            - '--speculative-config={"method":"dspark","model":"/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview","num_speculative_tokens":8,"draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
 
             # ------------------------------------------------------
-            # TUỲ CHỌN — Adaptive verification (bài 03, Bước 1).
-            # Confidence head của checkpoint dự đoán xác suất chấp nhận
-            # của từng vị trí -> engine tự quyết verify sâu bao nhiêu
-            # theo tải. Kỳ vọng giữ được lợi ích ở concurrency 32-64.
-            #
-            # Model card KHÔNG bật sẵn, và tài liệu vLLM tham chiếu các
-            # backend trên SM100 (H100 là SM90) -> hãy xác nhận cấu hình
-            # cơ sở chạy được TRƯỚC, rồi mới đổi sang dòng dưới đây.
-            #
-            # Comment dòng trên và bỏ comment dòng dưới:
-            # - '--speculative-config={"method":"dspark","model":"/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview","num_speculative_tokens":8,"enable_adaptive_verification":true}'
+            # KHÔNG DÙNG ĐƯỢC TRÊN H100 — enable_adaptive_verification.
+            # Checkpoint có confidence head (enable_confidence_head=true),
+            # nhưng adaptive verification cắt draft NGAY TRÊN DEVICE, nên
+            # attention backend phải đọc query length từ device tensor
+            # (supports_device_cpu_query_lens_mismatch). Trong vLLM 0.29 chỉ
+            # có FlashInfer trtllm-gen (SM100 / Blackwell) và MLA indexer
+            # (DeepSeek) làm được -> trên H100 (SM90) engine không tìm được
+            # backend hợp lệ. Đây là lý do cấu hình DeepSeek bật được nó.
             # ------------------------------------------------------
           env:
             - name: HF_TOKEN

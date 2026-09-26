@@ -425,7 +425,7 @@ vllm-router \
 |---|---|---|---|
 | `--max-num-batched-tokens` | `16384` | `2048` | Prefill muốn nhồi thật nhiều token/batch; decode chỉ cần đủ cho các bước verify |
 | `--max-num-seqs` | `16` | `128` | Prefill xử lý ít seq nhưng dài; decode cần batch rộng để tận dụng băng thông |
-| `--speculative-config` | **DSpark (8 token)** | DSpark (8 token) | **Phải giống hệt nhau**, nếu không NIXL từ chối truyền KV |
+| `--speculative-config` | **DSpark (8 token, `probabilistic` + `block`)** | DSpark (8 token, `probabilistic` + `block`) | **Phải giống hệt nhau**, nếu không NIXL từ chối truyền KV |
 | `--gpu-memory-utilization` | `0.88` | `0.88` | Mỗi bên có GPU riêng — không phải chia thủ công như khi dùng chung |
 | `--tensor-parallel-size` | `1` | `1` | Một engine = một GPU. PD dùng 2 GPU vì có **2 engine**, không phải vì tăng TP |
 | `--block-size` | `128` | `128` | **Phải giống nhau** — NIXL truyền KV theo block |

@@ -107,7 +107,7 @@ spec:
             # Lech cau hinh -> hash khac nhau -> handshake_failed:
             #   RuntimeError: NIXL compatibility hash mismatch
             # va decode sinh ra RAC thay vi tu bao loi.
-            - '--speculative-config={"method":"dspark","model":"/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview","num_speculative_tokens":8}'
+            - '--speculative-config={"method":"dspark","model":"/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview","num_speculative_tokens":8,"draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
           env:
             - name: HF_TOKEN
               valueFrom:
@@ -299,7 +299,7 @@ spec:
             # token, speculative decoding ở đó chỉ làm chậm.
             # Đây là lợi ích mà agg mode không có được: bật spec decoding
             # cho ĐÚNG nửa cần nó.
-            - '--speculative-config={"method":"dspark","model":"/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview","num_speculative_tokens":8}'
+            - '--speculative-config={"method":"dspark","model":"/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview","num_speculative_tokens":8,"draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
           env:
             - name: HF_TOKEN
               valueFrom:
