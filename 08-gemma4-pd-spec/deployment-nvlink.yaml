@@ -1,0 +1,167 @@
+# Bài 08 — biến thể NVLink: 1P1D trong MỘT pod 2 GPU.
+#
+# VÌ SAO CẦN BIẾN THỂ NÀY
+# -----------------------
+# deployment.yaml đặt P và D ở hai pod riêng, mỗi pod xin 1 GPU. Device
+# plugin chỉ mount đúng GPU đã cấp cho từng container, nên:
+#   - P thấy mỗi GPU của nó (vd PCIe A6:00.0), D thấy mỗi GPU của nó (1C:00.0)
+#   - UCX KHÔNG dùng được cuda_ipc: tiến trình nhận phải thấy GPU chứa bộ nhớ
+#   - pod không có /dev/infiniband -> cũng không có RDMA
+#   => NIXL rơi về TCP + staging qua RAM, đo được ~365 MB/s ổn định,
+#      ~1,1 s cho mỗi prompt 8k (~400 MB KV). NVLink nhanh hơn hàng trăm lần.
+#
+# Ở đây một container xin 2 GPU và chạy cả hai engine:
+#   P: CUDA_VISIBLE_DEVICES=0,1 -> dùng GPU 0, vẫn THẤY GPU 1
+#   D: CUDA_VISIBLE_DEVICES=1,0 -> dùng GPU 1, vẫn THẤY GPU 0
+# vLLM với TP=1 luôn dùng thiết bị đầu tiên trong danh sách, còn thiết bị thứ
+# hai chỉ để UCX mở IPC handle của engine bên kia -> cuda_ipc qua NVLink.
+#
+# Mọi cờ engine GIỐNG HỆT deployment.yaml (xem chú thích chi tiết ở đó),
+# đặc biệt --speculative-config và --block-size phải trùng ở P và D.
+#
+# Kiểm tra sau khi lên:
+#   kubectl exec -n token-factory deploy/vllm-g4-pdn -c engines -- nvidia-smi topo -m
+#     -> ô GPU0/GPU1 phải là NV#, không phải PHB/SYS
+#   kubectl logs -n token-factory deploy/vllm-g4-pdn -c engines | grep "KV Transfer metrics"
+#     -> Throughput (MB/s) phải lên hàng chục nghìn, không còn ~365
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-g4-pdn
+  namespace: token-factory
+  labels: { app: vllm-g4-pdn, lab: "08-gemma4-pd-nvlink" }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-g4-pdn
+  template:
+    metadata:
+      labels: { app: vllm-g4-pdn, lab: "08-gemma4-pd-nvlink" }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: engines
+          image: vllm/vllm-openai:v0.29.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              MODEL=/models/google/gemma-4-26B-A4B-it-fp8-dynamic
+              SPEC='{"method":"mtp","model":"/models/speculators/google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'
+              COMMON=(
+                --served-model-name=gemma4-26b-a4b
+                --host=0.0.0.0
+                --trust-remote-code
+                --tensor-parallel-size=1
+                --gpu-memory-utilization=0.89
+                --max-model-len=131072
+                --attention-backend=FLASH_ATTN
+                --block-size=128
+                --enable-prefix-caching
+                '--limit-mm-per-prompt={"image":8,"video":0}'
+                --reasoning-parser=gemma4
+                --tool-call-parser=gemma4
+                --enable-auto-tool-choice
+                "--speculative-config=$SPEC"
+              )
+
+              CUDA_VISIBLE_DEVICES=0,1 VLLM_NIXL_SIDE_CHANNEL_PORT=5557 \
+              vllm serve "$MODEL" "${COMMON[@]}" --port=8001 \
+                --max-num-batched-tokens=16384 --max-num-seqs=16 \
+                '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}' \
+                2>&1 | sed -u 's/^/[P] /' &
+
+              CUDA_VISIBLE_DEVICES=1,0 VLLM_NIXL_SIDE_CHANNEL_PORT=5558 \
+              vllm serve "$MODEL" "${COMMON[@]}" --port=8002 \
+                --max-num-batched-tokens=2048 --max-num-seqs=128 \
+                '--compilation-config={"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+                '--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}' \
+                2>&1 | sed -u 's/^/[D] /' &
+
+              # Mot engine chet -> ca container chet -> kubelet khoi dong lai,
+              # thay vi de mot nua he thong treo am tham.
+              wait -n
+              echo "!! mot engine da thoat, dung container"
+              exit 1
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token } }
+            # Hai engine cung mot network namespace -> goi nhau qua localhost.
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              value: "127.0.0.1"
+            - name: UCX_NET_DEVICES
+              value: "all"
+            - name: VLLM_CACHE_ROOT
+              value: /cache
+          ports:
+            - { name: prefill, containerPort: 8001 }
+            - { name: decode,  containerPort: 8002 }
+          resources:
+            requests: { cpu: "12", memory: 96Gi, nvidia.com/gpu: 2 }
+            limits:   { cpu: "24", memory: 128Gi, nvidia.com/gpu: 2 }
+          volumeMounts:
+            - { name: model-cache, mountPath: /models, readOnly: true }
+            - { name: vllm-cache,  mountPath: /cache }
+            - { name: shm,         mountPath: /dev/shm }
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "curl -sf localhost:8001/health && curl -sf localhost:8002/health"]
+            failureThreshold: 150
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "curl -sf localhost:8001/health && curl -sf localhost:8002/health"]
+            periodSeconds: 10
+
+        # Router la sidecar trong cung pod -> goi engine qua localhost.
+        - name: router
+          image: vllm/vllm-openai:v0.29.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              if ! command -v vllm-router >/dev/null 2>&1; then
+                echo "==> cai vllm-router"
+                (command -v uv >/dev/null 2>&1 && uv pip install --system vllm-router) \
+                  || pip install --no-cache-dir vllm-router
+              fi
+              until curl -sf http://localhost:8001/health && curl -sf http://localhost:8002/health; do
+                echo "waiting for engines..."; sleep 10; done
+              exec vllm-router \
+                --policy round_robin \
+                --vllm-pd-disaggregation \
+                --prefill http://localhost:8001 \
+                --decode  http://localhost:8002 \
+                --host 0.0.0.0 \
+                --port 30000 \
+                --intra-node-data-parallel-size 1
+          ports:
+            - { name: http, containerPort: 30000 }
+          resources:
+            requests: { cpu: "2", memory: 4Gi }
+            limits:   { cpu: "4", memory: 8Gi }
+          readinessProbe:
+            tcpSocket: { port: 30000 }
+            periodSeconds: 10
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim: { claimName: model-cache, readOnly: true }
+        - name: vllm-cache
+          persistentVolumeClaim: { claimName: vllm-cache }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 32Gi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: vllm-g4-pdn, namespace: token-factory }
+spec:
+  selector: { app: vllm-g4-pdn }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+  type: ClusterIP

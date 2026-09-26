@@ -209,16 +209,17 @@ spec:
     spec:
       enableServiceLinks: false
       affinity:
-        # UU TIEN dat decode CUNG NODE voi prefill de KV di qua NVLink thay
-        # vi mang. Kiem tra topology bang 04-pd-disagg-dspark/00-nvlink-
-        # check-job.yaml -> tim "NV#" giua GPU0 va GPU1.
+        # BAT BUOC decode CUNG NODE voi prefill: PD cross-node khong duoc
+        # phep. Node khong con GPU trong -> D nam Pending, thay vi am tham
+        # chay qua mang.
+        # LUU Y: cung node van CHUA du de KV di NVLink - moi pod chi thay
+        # 1 GPU nen NIXL roi ve TCP (~365 MB/s). Dung deployment-nvlink.yaml
+        # (1 pod 2 GPU) cho phep do chinh thuc.
         podAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels: { app: vllm-g4-p }
-                topologyKey: kubernetes.io/hostname
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: vllm-g4-p }
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: vllm
           image: vllm/vllm-openai:v0.29.0
