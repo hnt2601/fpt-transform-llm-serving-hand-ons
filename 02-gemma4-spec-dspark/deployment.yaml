@@ -1,0 +1,121 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-g4-spec
+  namespace: token-factory
+  labels:
+    app: vllm-g4-spec
+    lab: "07-gemma4-spec"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-g4-spec
+  template:
+    metadata:
+      labels:
+        app: vllm-g4-spec
+        lab: "07-gemma4-spec"
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.29.0
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - /models/RedHatAI/gemma-4-12B-it-FP8-Dynamic
+            - --served-model-name=gemma4-12b
+            - --host=0.0.0.0
+            - --port=8000
+            - --trust-remote-code
+
+            - --tensor-parallel-size=1
+
+            - --gpu-memory-utilization=0.89
+            - --max-model-len=131072
+            - --attention-backend=FLASH_ATTN
+
+            - --enable-prefix-caching
+            - --max-num-batched-tokens=8192
+            - --max-num-seqs=128
+
+            - '--limit-mm-per-prompt={"image":8,"video":0,"audio":0}'
+
+            - --reasoning-parser=gemma4
+            - --tool-call-parser=gemma4
+            - --enable-auto-tool-choice
+
+            - '--speculative-config={"method":"dspark","model":"/models/speculators/deepseek-ai/dspark_gemma4_12b_block7","num_speculative_tokens":7}'
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            - name: VLLM_CACHE_ROOT
+              value: /cache
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: vllm-cache
+              mountPath: /cache
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            failureThreshold: 120
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        - name: vllm-cache
+          persistentVolumeClaim:
+            claimName: vllm-cache
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-g4-spec
+  namespace: token-factory
+  labels:
+    app: vllm-g4-spec
+spec:
+  selector:
+    app: vllm-g4-spec
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP

@@ -1,6 +1,3 @@
-# Xác minh trọng số đã có đủ và ĐÚNG ĐƯỜNG DẪN mà các bài 01-04 mong đợi.
-# Chạy job này TRƯỚC khi deploy bài 01 — nó tiết kiệm cho bạn 10 phút
-# chờ pod crash-loop vì sai một ký tự trong đường dẫn.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -18,31 +15,26 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              TARGET=/models/Qwen/Qwen3.8-27B-FP8
-              DRAFT=/models/speculators/RedHatAI/Qwen3.8-27B-speculator.dspark-preview
+              TARGET=/models/RedHatAI/gemma-4-12B-it-FP8-Dynamic
+              DRAFT=/models/speculators/deepseek-ai/dspark_gemma4_12b_block7
               RC=0
 
               echo "===== [1/2] Target model ====="
               echo "Mong đợi: ${TARGET}"
-              if [ -f "${TARGET}/config.json" ]; then
-                echo "  OK  config.json"
-                echo "  OK  số file safetensors: $(ls "${TARGET}" | grep -c safetensors)"
-                # mtp.safetensors = MTP head tích hợp -> bài 02 dùng được
-                if [ -f "${TARGET}/mtp.safetensors" ]; then
-                  echo "  OK  mtp.safetensors (bài 02 dùng MTP head này)"
+              for f in config.json model.safetensors processor_config.json tokenizer.json; do
+                if [ -f "${TARGET}/${f}" ]; then
+                  echo "  OK     ${f}"
                 else
-                  echo "  CANH BAO: không thấy mtp.safetensors — bài 02 (MTP) có thể không chạy"
+                  echo "  THIEU  ${f}"
+                  RC=1
                 fi
-                echo "  dung lượng: $(du -sh "${TARGET}" 2>/dev/null | cut -f1)"
-              else
-                echo "  THIEU: không thấy ${TARGET}/config.json"
-                RC=1
-              fi
+              done
+              echo "  dung lượng: $(du -sh "${TARGET}" 2>/dev/null | cut -f1)"
               echo
 
-              echo "===== [2/2] DSpark speculator ====="
+              echo "===== [2/2] DSpark drafter ====="
               echo "Mong đợi: ${DRAFT}"
-              for f in config.json config.py model.safetensors; do
+              for f in config.json model.safetensors; do
                 if [ -f "${DRAFT}/${f}" ]; then
                   echo "  OK     ${f}"
                 else
@@ -50,6 +42,7 @@ spec:
                   RC=1
                 fi
               done
+              grep -o '"block_size": *[0-9]*' "${DRAFT}/config.json" 2>/dev/null | sed 's/^/  /'
               echo
 
               if [ "${RC}" != "0" ]; then
@@ -57,11 +50,11 @@ spec:
                 echo "KHONG DAT."
                 echo
                 echo "Các thư mục có thể khớp, tìm dưới /models:"
-                find /models -maxdepth 3 -iname "*Qwen3.8*" 2>/dev/null | head -20
+                find /models -maxdepth 3 \( -iname "*gemma-4-12B*" -o -iname "*dspark_gemma4*" \) 2>/dev/null | head -20
                 echo
                 echo "Hai cách xử lý:"
-                echo "  A. Layout khác mong đợi -> sửa đường dẫn trong deployment.yaml"
-                echo "     của bài 01-04. README bài 00 mục 'Layout thư mục trọng số'"
+                echo "  A. Layout khác mong đợi -> sửa đường dẫn trong deployment của"
+                echo "     bài 01-03. README bài 00 mục 'Layout thư mục trọng số'"
                 echo "     liệt kê đầy đủ các chỗ cần sửa."
                 echo "  B. Trọng số chưa được stage"
                 echo "     -> Lane tự học: chạy 03-model-download-job.yaml"

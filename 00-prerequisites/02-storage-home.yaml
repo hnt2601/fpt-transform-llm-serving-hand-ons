@@ -1,20 +1,3 @@
-# ==============================================================
-# LANE TỰ HỌC Ở NHÀ — chưa có trọng số, cần tải về.
-#
-# Dùng file này THAY CHO 02-storage-workshop.yaml, rồi chạy
-# 03-model-download-job.yaml để tải trọng số xuống PVC.
-#
-# Khác biệt duy nhất so với lane workshop: `model-cache` là PVC
-# dynamic GHI ĐƯỢC (để job tải về), thay vì hostPath read-only.
-# Các bài 01-04 KHÔNG cần sửa gì — vẫn mount cùng tên PVC vào /models.
-#
-# LƯU Ý: file này dựa vào dynamic provisioning CHẠY ĐƯỢC. Hãy kiểm
-# chứng bằng một pod thật, đừng tin mỗi trạng thái `Bound`:
-#   kubectl get pvc -n token-factory
-#   kubectl describe pod <pod-dùng-pvc> | sed -n '/Events:/,$p'
-# Nếu thấy `FailedAttachVolume`, StorageClass của bạn hỏng —
-# chuyển sang hostPath PV như 02-storage-workshop.yaml.
-# ==============================================================
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -26,8 +9,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 120Gi        # Qwen3.8-27B-FP8 (~28GB) + speculator (~4GB) + dư
-  # storageClassName: <SỬA CHO KHỚP CLUSTER CỦA BẠN>   # xem: kubectl get sc
+      storage: 60Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

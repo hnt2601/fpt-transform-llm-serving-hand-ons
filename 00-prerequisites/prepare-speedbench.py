@@ -1,29 +1,4 @@
-"""Sinh SPEED-Bench jsonl cho chuỗi bài FPT Transform Token Factory.
-
-Vì sao cần script này thay vì gọi thẳng prepare.py của NVIDIA:
-
-  `throughput_8k` có 268/1536 bản ghi (17%) lấy nội dung từ `cais/hle`
-  (Humanity's Last Exam) — một dataset GATED trên HuggingFace. Không có
-  quyền thì prepare.py dừng hẳn:
-
-      datasets.exceptions.DatasetNotFoundError:
-      Dataset 'cais/hle' is a gated dataset on the Hub.
-
-  Script này lọc bỏ các bản ghi thuộc nguồn gated TRƯỚC khi gọi phần
-  resolve của NVIDIA, nên chạy được mà không cần xin quyền. Phần còn lại
-  (~83%) vẫn giữ nguyên repobench_python/java — chính là dữ liệu code
-  completion sát với workload agentic coding nhất.
-
-  ĐỂ CÓ BẢN ĐẦY ĐỦ: xin quyền tại https://huggingface.co/datasets/cais/hle
-  rồi chạy lại KHÔNG kèm --skip-gated.
-
-Cách dùng:
-  python3 prepare-speedbench.py \
-      --config throughput_8k \
-      --output_dir /datasets/speed-bench \
-      --prepare /tmp/prepare.py \
-      --skip-gated
-"""
+"""Sinh SPEED-Bench jsonl, bỏ các nguồn gated. Dùng: python3 prepare-speedbench.py --config throughput_8k --output_dir out --prepare prepare.py --skip-gated"""
 import argparse, importlib.util, sys
 from pathlib import Path
 from datasets import load_dataset

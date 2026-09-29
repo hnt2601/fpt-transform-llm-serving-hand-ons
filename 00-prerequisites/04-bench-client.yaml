@@ -1,5 +1,3 @@
-# Bench client: chứa vLLM CLI để chạy `vllm bench serve`.
-# KHÔNG xin GPU — chỉ đóng vai client sinh tải.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,24 +13,15 @@ spec:
       labels:
         app: bench-client
     spec:
-      # K8s tự tiêm biến môi trường cho mọi Service trong namespace
-      # (Service `vllm-agg` -> VLLM_AGG_SERVICE_HOST, VLLM_AGG_PORT, ...).
-      # vLLM thấy prefix VLLM_ nên log 8 dòng WARNING "Unknown vLLM
-      # environment variable" ngay lúc khởi động — vô hại nhưng gây hoang
-      # mang. Tắt hẳn việc tiêm biến đó.
       enableServiceLinks: false
       containers:
         - name: bench
-          image: vllm/vllm-openai:v0.29.0   # workshop: image đã pull sẵn trên node
+          image: vllm/vllm-openai:v0.29.0
           imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -uo pipefail
-              # Dataset `speed_bench` dùng pandas (extras `vllm[bench]`),
-              # KHÔNG có sẵn trong image vllm/vllm-openai. Thiếu nó thì
-              # lệnh benchmark báo:
-              #   ImportError: Please install vllm[bench] for bench support
               if ! python3 -c "import pandas" >/dev/null 2>&1; then
                 echo "==> cài pandas cho dataset speed_bench"
                 pip install --no-cache-dir pandas || \
@@ -47,10 +36,8 @@ spec:
                 secretKeyRef:
                   name: hf-token
                   key: token
-            # Tokenizer đọc từ PVC để không phải gọi ra HuggingFace khi bench
             - name: MODEL_PATH
-              value: /models/Qwen/Qwen3.8-27B-FP8
-            # Thư mục dataset SPEED-Bench (job 07 sinh ra)
+              value: /models/RedHatAI/gemma-4-12B-it-FP8-Dynamic
             - name: DATASET_DIR
               value: /datasets/speed-bench
           volumeMounts:
@@ -64,7 +51,7 @@ spec:
               readOnly: true
           resources:
             requests:
-              cpu: "8"      # client phải đủ mạnh, nếu không chính nó là bottleneck
+              cpu: "8"
               memory: 16Gi
             limits:
               cpu: "16"

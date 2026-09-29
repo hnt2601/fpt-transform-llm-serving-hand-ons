@@ -1,29 +1,28 @@
-#!/usr/bin/env python3
-"""Kiem tra --limit-mm-per-prompt={"image":8} co duoc thuc thi khong.
 
-Gui lan luot 8, 9, 10 anh mau dac toi endpoint chat va in ket qua.
-Mong doi:  8 anh -> 200 OK va model doc dung thu tu mau
-           9+    -> 400 BadRequestError
-
-Khong can PIL: PNG duoc dung thang bang zlib + struct.
-Dung: python3 test-images.py [base_url]
-"""
+"""Kiểm tra giới hạn 8 ảnh/request. Dùng: python3 test-images.py [base_url]"""
 import base64, json, struct, sys, urllib.error, urllib.request, zlib
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://vllm-g4-agg:8000"
-MODEL = "gemma4-26b-a4b"
+MODEL = "gemma4-12b"
 
 COLORS = [
     ("red", (255, 0, 0)), ("green", (0, 255, 0)), ("blue", (0, 0, 255)),
     ("yellow", (255, 255, 0)), ("magenta", (255, 0, 255)), ("cyan", (0, 255, 255)),
-    ("white", (255, 255, 255)), ("black", (0, 0, 0)),
-    ("orange", (255, 128, 0)), ("purple", (128, 0, 255)),
+    ("white", (255, 255, 255)), ("orange", (255, 128, 0)),
+    ("purple", (128, 0, 255)), ("pink", (255, 128, 192)),
 ]
 
 
-def png(rgb, size=64):
-    """PNG mau dac size x size, khong phu thuoc thu vien ngoai."""
-    raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+BG = (128, 128, 128)
+
+
+def png(rgb, size=256):
+    """PNG size x size: hinh tron mau rgb tren nen xam, khong dung thu vien ngoai."""
+    c, r2 = size / 2, (size * 0.31) ** 2
+    raw = b"".join(
+        b"\x00" + b"".join(bytes(rgb if (x - c) ** 2 + (y - c) ** 2 <= r2 else BG)
+                           for x in range(size))
+        for y in range(size))
 
     def chunk(tag, data):
         body = tag + data
@@ -45,8 +44,9 @@ def ask(n):
     ]
     content.append({
         "type": "text",
-        "text": f"There are {n} solid-color images above. List their colors "
-                f"in order, comma-separated. Answer with color names only.",
+        "text": f"Each of the {n} images above shows one colored circle on a "
+                f"gray background. List the circle colors in order, "
+                f"comma-separated. Answer with color names only.",
     })
     body = json.dumps({
         "model": MODEL,

@@ -1,4 +1,3 @@
-# Xác nhận node GPU đúng là H100 80GB trước khi bắt đầu benchmark.
 apiVersion: batch/v1
 kind: Job
 metadata:
