@@ -30,7 +30,8 @@ spec:
                   return default
 
               rows = []
-              for path in sorted(glob.glob("/results/0[1-3]-g12-*-c*.json")):
+              paths = [p for k in LABELS for p in glob.glob(f"/results/{k}-c*.json")]
+              for path in sorted(paths):
                   try:
                       d = json.load(open(path))
                   except Exception as e:

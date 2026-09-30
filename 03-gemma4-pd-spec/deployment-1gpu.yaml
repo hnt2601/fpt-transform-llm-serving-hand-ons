@@ -84,7 +84,7 @@ spec:
             - { name: prefill, containerPort: 8001 }
             - { name: decode,  containerPort: 8002 }
           resources:
-            requests: { cpu: "12", memory: 96Gi, nvidia.com/gpu: 1 }
+            requests: { cpu: "8", memory: 96Gi, nvidia.com/gpu: 1 }
             limits:   { cpu: "24", memory: 128Gi, nvidia.com/gpu: 1 }
           volumeMounts:
             - { name: model-cache, mountPath: /models, readOnly: true }
@@ -125,7 +125,7 @@ spec:
           ports:
             - { name: http, containerPort: 30000 }
           resources:
-            requests: { cpu: "2", memory: 4Gi }
+            requests: { cpu: "1", memory: 4Gi }
             limits:   { cpu: "4", memory: 8Gi }
           readinessProbe:
             tcpSocket: { port: 30000 }

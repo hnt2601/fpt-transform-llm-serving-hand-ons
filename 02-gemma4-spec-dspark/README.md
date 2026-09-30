@@ -34,7 +34,8 @@ kubectl rollout status deploy/vllm-g4-spec -n token-factory --timeout=15m
 
 ```bash
 kubectl logs -n token-factory -l app=vllm-g4-spec --tail=1500 \
-  | grep -E "dspark|Available KV cache|KV cache size|multimodal embeddings"
+  | grep -E "speculative_config=|Available KV cache|KV cache size|multimodal embeddings" \
+  | cut -c1-250
 ```
 
 So KV cache với bài 01 và ghi vào bảng ở cuối bài.

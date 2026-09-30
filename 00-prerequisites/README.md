@@ -75,7 +75,7 @@ kubectl get pods,deploy,svc,job,pvc -n token-factory
 ```bash
 kubectl create secret generic hf-token \
   --from-literal=token="hf_xxxxxxxxxxxxxxxxxxxx" \
-  -n token-factory
+  -n token-factory --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 Không commit token vào git. `01-hf-secret.yaml` chỉ là template tham khảo.
@@ -87,8 +87,8 @@ kubectl apply -f 02-storage-workshop.yaml
 kubectl get pvc -n token-factory
 ```
 
-Cả ba PVC `bench-results`, `model-cache`, `vllm-cache` phải ở trạng thái
-`Bound`. Sang [Bước 4](#bước-4--xác-minh-trọng-số).
+Cả bốn PVC `bench-datasets`, `bench-results`, `model-cache`, `vllm-cache`
+phải ở trạng thái `Bound`. Sang [Bước 4](#bước-4--xác-minh-trọng-số).
 
 ## Bước 3B — Storage + tải trọng số (tự học)
 

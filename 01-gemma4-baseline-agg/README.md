@@ -80,9 +80,9 @@ rows=[]
 for f in glob.glob("/results/01-g12-agg-c*.json"):
     c=int(re.search(r"-c(\d+)\.json",f).group(1)); d=json.load(open(f))
     rows.append((c,d["output_throughput"],d["median_tpot_ms"],d["median_itl_ms"],d["median_ttft_ms"]))
-print(f"{\"c\":>4} {\"tok/s\":>9} {\"TPOT ms\":>9} {\"ITL ms\":>9} {\"TTFT ms\":>9}")
-for c,t,tp,it,tt in sorted(rows):
-    print(f"{c:>4} {t:>9.1f} {tp:>9.2f} {it:>9.2f} {tt:>9.0f}")
+print("%4s %9s %9s %9s %9s" % ("c","tok/s","TPOT ms","ITL ms","TTFT ms"))
+for r in sorted(rows):
+    print("%4d %9.1f %9.2f %9.2f %9.0f" % r)
 '
 ```
 
